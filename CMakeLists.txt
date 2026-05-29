@@ -19,6 +19,17 @@ set(VLLM_TARGET_DEVICE "cuda" CACHE STRING "Target device backend for vLLM")
 set(VLLM_FA_INSTALL_DIR "vllm_flash_attn" CACHE STRING
     "Install directory name for the FA Python package")
 
+# Library/target names for the FA2 and FA3 CUDA extensions. Defaults match
+# the upstream values so existing builds are unaffected. Downstream
+# consumers needing to coexist with upstream vllm-flash-attn (which builds
+# under the same default names) MUST override these to disambiguate the
+# global CMake target namespace AND the auto-derived TORCH_EXTENSION_NAME
+# (which becomes the torch.ops namespace registered by the .so).
+set(VLLM_FA2_LIB_NAME "_vllm_fa2_C" CACHE STRING
+    "Library/target name for the FA2 C extension")
+set(VLLM_FA3_LIB_NAME "_vllm_fa3_C" CACHE STRING
+    "Library/target name for the FA3 C extension")
+
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "Target device: ${VLLM_TARGET_DEVICE}")
 
@@ -155,7 +166,7 @@ if (FA2_ENABLED)
     endif()
 
     define_gpu_extension_target(
-        _vllm_fa2_C
+        ${VLLM_FA2_LIB_NAME}
         DESTINATION ${VLLM_FA_INSTALL_DIR}
         LANGUAGE ${VLLM_GPU_LANG}
         SOURCES
@@ -167,14 +178,14 @@ if (FA2_ENABLED)
         USE_SABI 3
         WITH_SOABI)
 
-    target_include_directories(_vllm_fa2_C PRIVATE
+    target_include_directories(${VLLM_FA2_LIB_NAME} PRIVATE
         csrc/flash_attn
         csrc/flash_attn/src
         csrc/common
         csrc/cutlass/include)
 
     # custom definitions
-    target_compile_definitions(_vllm_fa2_C PRIVATE
+    target_compile_definitions(${VLLM_FA2_LIB_NAME} PRIVATE
         FLASHATTENTION_DISABLE_BACKWARD
         FLASHATTENTION_DISABLE_DROPOUT
         # FLASHATTENTION_DISABLE_ALIBI
@@ -277,7 +288,7 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
     endif()
 
     define_gpu_extension_target(
-        _vllm_fa3_C
+        ${VLLM_FA3_LIB_NAME}
         DESTINATION ${VLLM_FA_INSTALL_DIR}
         LANGUAGE ${VLLM_GPU_LANG}
         SOURCES
@@ -291,13 +302,13 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
         USE_SABI 3
         WITH_SOABI)
 
-    target_include_directories(_vllm_fa3_C PRIVATE
+    target_include_directories(${VLLM_FA3_LIB_NAME} PRIVATE
         hopper
         csrc/common
         csrc/cutlass/include)
 
     # custom definitions
-    target_compile_definitions(_vllm_fa3_C PRIVATE
+    target_compile_definitions(${VLLM_FA3_LIB_NAME} PRIVATE
         FLASHATTENTION_DISABLE_BACKWARD
         FLASHATTENTION_DISABLE_DROPOUT
         # FLASHATTENTION_DISABLE_ALIBI

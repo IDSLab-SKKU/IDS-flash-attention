@@ -9,21 +9,89 @@ import torch.nn as nn
 # We need to import the CUDA kernels after importing torch
 # Use relative import to support build-from-source installation in vLLM
 
-try:
-    from . import _vllm_fa2_C  # noqa: F401
-    FA2_UNAVAILABLE_REASON = None
-    FA2_AVAILABLE = True
-except ImportError as e:
-    FA2_UNAVAILABLE_REASON = str(e)
+# --- FA C extension discovery -------------------------------------------
+# Historically the FA2 and FA3 CUDA extensions are imported by hardcoded
+# names. When this package is built with the
+# names overridden via VLLM_FA{2,3}_LIB_NAME (e.g. for parallel install
+# alongside upstream vllm-flash-attn), the .so basenames change. Detect
+# them at import time by scanning the package directory so the rest of
+# this file can use a single name regardless of build configuration.
+import importlib as _importlib
+import os as _os
+
+
+def _discover_fa_lib(token: str) -> "str | None":
+    """Return the importable basename of an FA extension matching `token`.
+
+    Looks for a .so / .pyd file in this package's directory whose Python
+    importable name (everything before the first dot) contains `token`.
+    Returns None if no match is found.
+    """
+    pkg_dir = _os.path.dirname(__file__)
+    try:
+        entries = _os.listdir(pkg_dir)
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.endswith((".so", ".pyd")):
+            continue
+        name = entry.split(".", 1)[0]
+        if token in name:
+            return name
+    return None
+
+
+_FA2_LIB_NAME = _discover_fa_lib("_fa2_C")
+_FA3_LIB_NAME = _discover_fa_lib("_fa3_C")
+
+_fa2_module = None
+_fa3_module = None
+if _FA2_LIB_NAME is not None:
+    try:
+        _fa2_module = _importlib.import_module(
+            "." + _FA2_LIB_NAME, package=__name__.rsplit(".", 1)[0]
+        )
+        FA2_UNAVAILABLE_REASON = None
+        FA2_AVAILABLE = True
+    except ImportError as e:
+        FA2_UNAVAILABLE_REASON = str(e)
+        FA2_AVAILABLE = False
+else:
+    FA2_UNAVAILABLE_REASON = "FA2 C extension not found in vllm_flash_attn package directory"
     FA2_AVAILABLE = False
 
-try:
-    from . import _vllm_fa3_C  # noqa: F401
-    FA3_UNAVAILABLE_REASON = None
-    FA3_AVAILABLE = True
-except ImportError as e:
-    FA3_UNAVAILABLE_REASON = str(e)
+if _FA3_LIB_NAME is not None:
+    try:
+        _fa3_module = _importlib.import_module(
+            "." + _FA3_LIB_NAME, package=__name__.rsplit(".", 1)[0]
+        )
+        FA3_UNAVAILABLE_REASON = None
+        FA3_AVAILABLE = True
+    except ImportError as e:
+        FA3_UNAVAILABLE_REASON = str(e)
+        FA3_AVAILABLE = False
+else:
+    FA3_UNAVAILABLE_REASON = "FA3 C extension not found in vllm_flash_attn package directory"
     FA3_AVAILABLE = False
+
+
+def _fa2_ops():
+    """Return the torch.ops namespace for the FA2 extension."""
+    if _FA2_LIB_NAME is None:
+        raise ImportError(
+            "FA2 C extension not found in vllm_flash_attn package directory"
+        )
+    return getattr(__import__("torch").ops, _FA2_LIB_NAME)
+
+
+def _fa3_ops():
+    """Return the torch.ops namespace for the FA3 extension."""
+    if _FA3_LIB_NAME is None:
+        raise ImportError(
+            "FA3 C extension not found in vllm_flash_attn package directory"
+        )
+    return getattr(__import__("torch").ops, _FA3_LIB_NAME)
+# --- end FA C extension discovery ---------------------------------------
 
 try:
     from flash_attn.cute.interface import _flash_attn_fwd  # noqa: F401
@@ -111,7 +179,7 @@ def get_scheduler_metadata(
     cache_seqlens = maybe_contiguous(cache_seqlens)
     if headdim_v is None:
         headdim_v = headdim
-    scheduler_metadata = torch.ops._vllm_fa3_C.get_scheduler_metadata(
+    scheduler_metadata = _fa3_ops().get_scheduler_metadata(
         batch_size, max_seqlen_q, max_seqlen_k, num_heads_q, num_heads_kv, headdim, headdim_v,
         qkv_dtype,
         cache_seqlens,
@@ -250,7 +318,7 @@ def flash_attn_varlen_func(
             raise NotImplementedError("FA2 does not support s_aux")
         if num_splits > 1:
             raise NotImplementedError("FA2 does not support num_splits > 1")
-        out, softmax_lse = torch.ops._vllm_fa2_C.varlen_fwd(
+        out, softmax_lse = _fa2_ops().varlen_fwd(
             q, k, v,
             out,
             cu_seqlens_q,
@@ -276,7 +344,7 @@ def flash_attn_varlen_func(
         )
     elif fa_version == 3:
         assert alibi_slopes is None, "Alibi is not supported in FA3"
-        out, softmax_lse, _, _ = torch.ops._vllm_fa3_C.fwd(
+        out, softmax_lse, _, _ = _fa3_ops().fwd(
             q, k, v,
             None, None,       # k_new, v_new
             q_v,
@@ -365,7 +433,7 @@ def sparse_attn_func(
         softmax_scale = q.shape[-1] ** (-0.5)
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, softmax_lse = torch.ops._vllm_fa2_C.fwd_sparse(
+    out, softmax_lse = _fa2_ops().fwd_sparse(
         q,
         k,
         v,
@@ -451,7 +519,7 @@ def sparse_attn_varlen_func(
         softmax_scale = q.shape[-1] ** (-0.5)
         
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, softmax_lse = torch.ops._vllm_fa2_C.varlen_fwd_sparse(
+    out, softmax_lse = _fa2_ops().varlen_fwd_sparse(
         q,
         k,
         v,
