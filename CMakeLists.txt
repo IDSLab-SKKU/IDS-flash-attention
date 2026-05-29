@@ -10,6 +10,15 @@ set(FA3_ENABLED ON)
 # CUDA by default, can be overridden by using -DVLLM_TARGET_DEVICE=... (used by setup.py)
 set(VLLM_TARGET_DEVICE "cuda" CACHE STRING "Target device backend for vLLM")
 
+# Install directory name for the built Python package. Defaults to
+# vllm_flash_attn for backwards compatibility with the upstream layout.
+# Downstream consumers (e.g. an IDS-FA fork being installed alongside
+# upstream FA in the same site-packages tree) can override this via
+#   -DVLLM_FA_INSTALL_DIR=ids_flash_attn
+# to disambiguate the install location.
+set(VLLM_FA_INSTALL_DIR "vllm_flash_attn" CACHE STRING
+    "Install directory name for the FA Python package")
+
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "Target device: ${VLLM_TARGET_DEVICE}")
 
@@ -147,7 +156,7 @@ if (FA2_ENABLED)
 
     define_gpu_extension_target(
         _vllm_fa2_C
-        DESTINATION vllm_flash_attn
+        DESTINATION ${VLLM_FA_INSTALL_DIR}
         LANGUAGE ${VLLM_GPU_LANG}
         SOURCES
             csrc/flash_attn/flash_api.cpp
@@ -269,7 +278,7 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
 
     define_gpu_extension_target(
         _vllm_fa3_C
-        DESTINATION vllm_flash_attn
+        DESTINATION ${VLLM_FA_INSTALL_DIR}
         LANGUAGE ${VLLM_GPU_LANG}
         SOURCES
             hopper/flash_fwd_combine.cu
