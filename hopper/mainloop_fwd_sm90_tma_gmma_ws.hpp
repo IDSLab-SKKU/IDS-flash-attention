@@ -30,7 +30,8 @@ using namespace cute;
 
 template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
-        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, class ElementSAux_, int kBlockH_=1>
+        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, class ElementSAux_, int kBlockH_=1,
+        bool DisableFP8TwoLevel_=false>
 struct CollectiveMainloopFwdSm90 {
 
     static constexpr int kStages = Stages;
@@ -43,6 +44,7 @@ struct CollectiveMainloopFwdSm90 {
     using ElementSAux = ElementSAux_;
     using ArchTag = ArchTag_;
     static constexpr bool Is_FP8 = cute::is_same_v<Element, cutlass::float_e4m3_t> || cute::is_same_v<Element, cutlass::float_e5m2_t>;;
+    static constexpr bool DisableFP8TwoLevel = DisableFP8TwoLevel_;
     static constexpr bool Is_causal = Is_causal_;
     static constexpr bool Is_local = Is_local_;
     static constexpr bool Has_softcap = Has_softcap_;
@@ -1212,13 +1214,13 @@ struct CollectiveMainloopFwdSm90 {
         if constexpr (IntraWGOverlap) {
             Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
             consumer_wait(pipeline_k, smem_pipe_read);
-            flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+            flash::gemm</*zero_init=*/true, /*wg_wait=*/-1, /*SwapAB=*/false, /*M_slice=*/-1, /*DisableFP8TwoLevel=*/DisableFP8TwoLevel>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
             warpgroup_wait<0>();
             pipeline_k.consumer_release(smem_pipe_read);
             if constexpr (HasQv) {
                 shared_storage.pipelines.barrier_Qv.wait(work_idx % 2);
                 consumer_wait(pipeline_v, smem_pipe_read);
-                flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
+                flash::gemm</*zero_init=*/false, /*wg_wait=*/0, /*SwapAB=*/false, /*M_slice=*/-1, /*DisableFP8TwoLevel=*/DisableFP8TwoLevel>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
             }
             scoremod_premask_fn(tSrS);
             mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
@@ -1248,12 +1250,12 @@ struct CollectiveMainloopFwdSm90 {
                 Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
                 if (!UseSchedulerBarrier || warp_group_idx == 0) { consumer_wait(pipeline_k, smem_pipe_read); }
                 warp_scheduler_barrier_sync();
-                flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+                flash::gemm</*zero_init=*/true, /*wg_wait=*/-1, /*SwapAB=*/false, /*M_slice=*/-1, /*DisableFP8TwoLevel=*/DisableFP8TwoLevel>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
                 if constexpr (RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
                 if constexpr(!HasQv) {
                     if (!UseSchedulerBarrier || warp_group_idx == 0) { consumer_wait(pipeline_v, smem_pipe_read_v); }
                 }
-                flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
+                flash::gemm</*zero_init=*/false, /*wg_wait=*/-1, /*SwapAB=*/false, /*M_slice=*/-1, /*DisableFP8TwoLevel=*/DisableFP8TwoLevel>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
                 warp_scheduler_barrier_arrive();
                 warpgroup_wait<1>();
                 pipeline_k.consumer_release(smem_pipe_read);  // release K
@@ -1261,7 +1263,7 @@ struct CollectiveMainloopFwdSm90 {
                     warpgroup_wait<0>();
                     pipeline_v.consumer_release(smem_pipe_read_v);  // release V
                     consumer_wait(pipeline_v, smem_pipe_read);
-                    flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
+                    flash::gemm</*zero_init=*/false, /*wg_wait=*/0, /*SwapAB=*/false, /*M_slice=*/-1, /*DisableFP8TwoLevel=*/DisableFP8TwoLevel>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
                 }
                 scoremod_premask_fn(tSrS);
                 mask_fn(tSrS, n_block);
@@ -1325,7 +1327,7 @@ struct CollectiveMainloopFwdSm90 {
             cutlass::arch::NamedBarrier::arrive(NumMmaThreadsQK + (Use_TMA_Q ? cutlass::NumThreadsPerWarp : NumProducerThreads), static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
             if constexpr (RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
             if constexpr (!HasQv) { consumer_wait(pipeline_v, smem_pipe_read); }
-            flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+            flash::gemm</*zero_init=*/false, /*wg_wait=*/-1, /*SwapAB=*/false, /*M_slice=*/-1, /*DisableFP8TwoLevel=*/DisableFP8TwoLevel>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
             float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
             // cute::copy(softmax.finalize(v_descale), scores_scale);
             finalize_dispatch(scores_scale, v_descale);
@@ -1351,7 +1353,7 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (!Is_first_iter) { ++smem_pipe_read; }
                 Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
                 consumer_wait(pipeline_k, smem_pipe_read);
-                flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+                flash::gemm</*zero_init=*/true, /*wg_wait=*/-1, /*SwapAB=*/false, /*M_slice=*/-1, /*DisableFP8TwoLevel=*/DisableFP8TwoLevel>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
                 if constexpr (!HasQv) {
                     warp_scheduler_barrier_arrive();
                     warpgroup_wait<0>();
@@ -1361,7 +1363,7 @@ struct CollectiveMainloopFwdSm90 {
                         shared_storage.pipelines.barrier_Qv.wait(work_idx % 2);
                     }
                     consumer_wait(pipeline_v, smem_pipe_read);
-                    flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
+                    flash::gemm</*zero_init=*/false, /*wg_wait=*/-1, /*SwapAB=*/false, /*M_slice=*/-1, /*DisableFP8TwoLevel=*/DisableFP8TwoLevel>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
                     warp_scheduler_barrier_arrive();
                     warpgroup_wait<1>();
                     pipeline_k.consumer_release(smem_pipe_read);  // release K
@@ -1383,10 +1385,10 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (!HasQv) { consumer_wait(pipeline_v, smem_pipe_read); }
                 warp_scheduler_barrier_sync();
                 if constexpr (!MmaPV_use_RS_WG1) {
-                    flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+                    flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1, /*SwapAB=*/false, /*M_slice=*/-1, /*DisableFP8TwoLevel=*/DisableFP8TwoLevel>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
                 } else {
                     TiledMmaPV_RS tiled_mma_pv_rs;
-                    flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1>(tiled_mma_pv_rs, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+                    flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1, /*SwapAB=*/false, /*M_slice=*/-1, /*DisableFP8TwoLevel=*/DisableFP8TwoLevel>(tiled_mma_pv_rs, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
                 }
                 if constexpr (!MmaPV_is_RS && MmaPV_use_RS_WG1) { arrive_on_P_write_barrier(); }
                 warpgroup_wait<0>();
@@ -1509,7 +1511,7 @@ struct CollectiveMainloopFwdSm90 {
         // If HasQv, then by the time P is ready, V must have been ready as well
         if constexpr (!HasQv) { pipeline_v.consumer_wait(smem_pipe_read); }
         cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PFull) /*id*/);
-        flash::gemm</*zero_init=*/true, /*wg_wait=*/0>(tiled_mma_pv, tOsP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+        flash::gemm</*zero_init=*/true, /*wg_wait=*/0, /*SwapAB=*/false, /*M_slice=*/-1, /*DisableFP8TwoLevel=*/DisableFP8TwoLevel>(tiled_mma_pv, tOsP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
         cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
         pipeline_v.consumer_release(smem_pipe_read);  // release V
         --n_block;
@@ -1524,7 +1526,7 @@ struct CollectiveMainloopFwdSm90 {
                 auto barrier_token = pipeline_v.consumer_try_wait(smem_pipe_read);
                 pipeline_v.consumer_wait(smem_pipe_read, barrier_token);
             }
-            flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_pv, tOsP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+            flash::gemm</*zero_init=*/false, /*wg_wait=*/0, /*SwapAB=*/false, /*M_slice=*/-1, /*DisableFP8TwoLevel=*/DisableFP8TwoLevel>(tiled_mma_pv, tOsP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
             cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
             pipeline_v.consumer_release(smem_pipe_read);  // release V
         };
