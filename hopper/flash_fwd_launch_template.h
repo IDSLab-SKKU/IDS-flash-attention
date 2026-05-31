@@ -231,7 +231,18 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
                                     // Non-unary values of kBlockH can improve GQA perf for specific ratios (4, 8, 16) by enabling TMA for loading Q
                                     // Disable for hdim diff, fp16, 1 mma wg or split to shrink build
                                     static constexpr int kBlockH = !PackGQA || Arch < 90 || (kHeadDim != kHeadDimV) || cute::is_same_v<T, cutlass::half_t> || Use_one_mma_wg || Split ? 1 : kBlockH_;
-                                    run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, Use_one_mma_wg, kBlockH>(params, stream);
+#ifndef FLASHATTENTION_DISABLE_FP8_TWO_LEVEL_ACCUMULATION
+                                    if constexpr (Is_FP8) {
+                                        // Per-call runtime choice between two-level (false) and no-two-level (true).
+                                        // Only instantiated for FP8 because of the surrounding `if constexpr (Is_FP8)`.
+                                        BOOL_SWITCH(params.fp8_no_two_level_accum, DisableFP8TwoLevel, [&] {
+                                            run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, Use_one_mma_wg, kBlockH, DisableFP8TwoLevel>(params, stream);
+                                        });
+                                    } else
+#endif
+                                    {
+                                        run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, Use_one_mma_wg, kBlockH, /*DisableFP8TwoLevel=*/false>(params, stream);
+                                    }
                                 });
                             });
                         });
