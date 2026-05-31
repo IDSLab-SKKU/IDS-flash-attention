@@ -142,6 +142,7 @@ struct Flash_fwd_params : public Qkv_params {
     bool is_bf16;
     bool is_fp32;
     bool is_e4m3;
+    bool fp8_no_two_level_accum;  // if true, skip FP8 two-level accumulation in the forward gemm (default false)
     bool is_causal;
     bool is_local;
 
