@@ -745,7 +745,8 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         std::optional<const at::Tensor> &s_aux_, // (h)
         int const cp_world_size,  // context parallelism (cp) world size
         int const cp_rank,         // cp rank
-        std::optional<const at::Tensor> &cp_tot_seqused_k_ // b. total seqused_k in cp world
+        std::optional<const at::Tensor> &cp_tot_seqused_k_, // b. total seqused_k in cp world
+        bool fp8_no_two_level_accum
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -1039,6 +1040,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     #ifdef FLASHATTENTION_PACKGQA_ONLY
     params.pack_gqa |= params.d == params.dv;
     #endif
+    params.fp8_no_two_level_accum = fp8_no_two_level_accum;
 
     bool const use_dynamic_split = use_prepare_varlen && params.b <= PREPARE_VARLEN_MAX_BATCHES_1CTA && params.num_splits > 1;
     // disable split for varlen and >992 batches for now
