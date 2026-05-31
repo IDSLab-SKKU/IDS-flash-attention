@@ -232,13 +232,13 @@ auto mma_partition_fragment_AB(Mma const& mma, Tensor0 const& tensor0) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <bool zero_init=false, int wg_wait=0, bool SwapAB=false, int M_slice=-1,
+template <bool zero_init=false, int wg_wait=0, bool SwapAB=false, int M_slice=-1, bool DisableFP8TwoLevel=false,
         typename Tensor0, typename Tensor1, typename Tensor2, typename TiledMma>
 CUTLASS_DEVICE void gemm(TiledMma& tiled_mma, Tensor0 const& tCrA, Tensor1 const& tCrB, Tensor2& tCrC) {
 #ifndef FLASHATTENTION_DISABLE_FP8_TWO_LEVEL_ACCUMULATION
     static constexpr bool Is_FP8 = cute::is_same_v<typename Tensor0::value_type, cutlass::float_e4m3_t> 
         || cute::is_same_v<typename Tensor0::value_type, cutlass::float_e5m2_t>;
-    static constexpr bool Use_Two_Level = Is_FP8 && !zero_init;
+    static constexpr bool Use_Two_Level = Is_FP8 && !zero_init && !DisableFP8TwoLevel;
     
     auto tCrC_original = cute::make_fragment_like(tCrC);
     if constexpr (Use_Two_Level) {
@@ -257,10 +257,10 @@ CUTLASS_DEVICE void gemm(TiledMma& tiled_mma, Tensor0 const& tCrA, Tensor1 const
         Tensor tCrC_slice = cute::logical_divide(tCrC, Shape<cute::Underscore, Int<MMA_M>>{})(_, make_coord(Int<M_slice>{}, _), _);
         if constexpr (!SwapAB) {
             Tensor tCrA_slice = cute::logical_divide(tCrA, Shape<cute::Underscore, Int<MMA_M>>{})(_, make_coord(Int<M_slice>{}, _), _);
-            gemm<zero_init, wg_wait, SwapAB, /*M_slice=*/-1>(tiled_mma, tCrA_slice, tCrB, tCrC_slice);
+            gemm<zero_init, wg_wait, SwapAB, /*M_slice=*/-1, DisableFP8TwoLevel>(tiled_mma, tCrA_slice, tCrB, tCrC_slice);
         } else {
             Tensor tCrB_slice = cute::logical_divide(tCrB, Shape<cute::Underscore, Int<MMA_M>>{})(_, make_coord(Int<M_slice>{}, _), _);
-            gemm<zero_init, wg_wait, SwapAB, /*M_slice=*/-1>(tiled_mma, tCrA, tCrB_slice, tCrC_slice);
+            gemm<zero_init, wg_wait, SwapAB, /*M_slice=*/-1, DisableFP8TwoLevel>(tiled_mma, tCrA, tCrB_slice, tCrC_slice);
         }
     } else {
         constexpr bool Is_RS = !cute::is_base_of<cute::GMMA::DescriptorIterator, typename TiledMma::FrgTypeA>::value;
