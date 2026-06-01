@@ -56,7 +56,9 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         int const cp_world_size,
         int const cp_rank,
         std::optional<const at::Tensor> &cp_tot_seqused_k,
-        bool fp8_no_two_level_accum = false
+        bool fp8_no_two_level_accum = false,
+        bool qk_emu_enabled = false,
+        int64_t qk_emu_fbits = 25
 );
 
 // Only applicable to the case where seqused_k (i.e. cache_seqlens) is available
@@ -128,7 +130,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "    int      cp_world_size,"
             "    int      cp_rank,"
             "    Tensor?  cp_tot_seqused_k,"
-            "    bool     fp8_no_two_level_accum=False) -> Tensor[]");
+            "    bool     fp8_no_two_level_accum=False,"
+            "    bool     qk_emu_enabled=False,"
+            "    int      qk_emu_fbits=25) -> Tensor[]");
     ops.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));
 
     ops.def("get_scheduler_metadata("
