@@ -237,10 +237,18 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
                                         // Per-call runtime choice between two-level (false) and no-two-level (true).
                                         // Only instantiated for FP8 because of the surrounding `if constexpr (Is_FP8)`.
                                         BOOL_SWITCH(params.fp8_no_two_level_accum, DisableFP8TwoLevel, [&] {
-                                            if (params.qk_emu_enabled && params.qk_emu_fbits == 13) {
-                                                run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, Use_one_mma_wg, kBlockH, DisableFP8TwoLevel, /*UseQKEmu=*/true, /*QKEmuFbits=*/13>(params, stream);
-                                            } else if (params.qk_emu_enabled) {  // f_bits == 25 (validated upstream in mha_fwd)
-                                                run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, Use_one_mma_wg, kBlockH, DisableFP8TwoLevel, /*UseQKEmu=*/true, /*QKEmuFbits=*/25>(params, stream);
+                                            // QK CoFDA emulation is compile-expensive (per-element software MMA, 3x
+                                            // instantiation). Only instantiate it for kHeadDim <= 128 — the configs the
+                                            // emulation is intended for. For larger head dims, always use the hardware
+                                            // path (qk_emu_enabled is rejected for kHeadDim > 128 in mha_fwd validation).
+                                            if constexpr (kHeadDim <= 128) {
+                                                if (params.qk_emu_enabled && params.qk_emu_fbits == 13) {
+                                                    run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, Use_one_mma_wg, kBlockH, DisableFP8TwoLevel, /*UseQKEmu=*/true, /*QKEmuFbits=*/13>(params, stream);
+                                                } else if (params.qk_emu_enabled) {  // f_bits == 25 (validated upstream in mha_fwd)
+                                                    run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, Use_one_mma_wg, kBlockH, DisableFP8TwoLevel, /*UseQKEmu=*/true, /*QKEmuFbits=*/25>(params, stream);
+                                                } else {
+                                                    run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, Use_one_mma_wg, kBlockH, DisableFP8TwoLevel, /*UseQKEmu=*/false, /*QKEmuFbits=*/25>(params, stream);
+                                                }
                                             } else {
                                                 run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, Use_one_mma_wg, kBlockH, DisableFP8TwoLevel, /*UseQKEmu=*/false, /*QKEmuFbits=*/25>(params, stream);
                                             }
