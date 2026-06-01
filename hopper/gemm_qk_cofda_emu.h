@@ -4,7 +4,7 @@
 // kernel.  Two parts:
 //   (a)  cofda_dot<F>(fa, fb, D)  — numeric core, decoupled from operand LAYOUT.
 //   (b)  flash::gemm_qk_cofda_emu — kernel entry that reads raw FP8 Q/K from
-//        SWIZZLED smem tensors.  Requires CuTe; gated on CUTE_TENSOR_HPP_INCLUDED.
+//        SWIZZLED smem tensors.  Requires CuTe.
 //
 // CAIR's fp8_cofda_mma expects DECODED operands (DecodedFrag over packed uint32)
 // because in CAIR's own kernel decode happens once at smem load.  In
@@ -14,7 +14,9 @@
 // the caller own the (swizzled tensor vs flat array) addressing.
 
 #pragma once
+#include <cassert>
 #include <cstdint>
+#include <cute/tensor.hpp>
 #include "cair_emu/cair_fp8_cofda_mma.cuh"  // vllm::cair::{fp8_cofda_mma<F,CHUNK_SIZE>, decode_operand, pack_decoded, DecodedFrag}
 
 // --- helper: reinterpret one FP8 element as its raw byte --------------------
@@ -38,6 +40,7 @@ __device__ __forceinline__ uint8_t fp8_bits(E const& e) {
 template <int F, class FetchA, class FetchB>
 __device__ float cofda_dot(FetchA fa, FetchB fb, int D) {
   constexpr int CHUNK = 32;
+  assert(D % 32 == 0);
   // Decoded operands in registers (NOT smem — one chunk at a time)
   uint32_t a_dec[CHUNK], b_dec[CHUNK];
   float acc = 0.f;
@@ -58,12 +61,8 @@ __device__ float cofda_dot(FetchA fa, FetchB fb, int D) {
 
 // --- (b) Kernel entry: replace the QK WGMMA. Reads raw FP8 Q/K from SWIZZLED smem.
 //
-// This section requires CuTe headers.  It is compiled only when cute/tensor.hpp
-// has already been included (e.g. from mainloop_fwd_sm90_tma_gmma_ws.hpp).
-// The standalone unit test only exercises cofda_dot/fp8_bits above and never
-// reaches this section, so the test compiles without CuTe on the include path.
-#ifdef CUTE_TENSOR_HPP_INCLUDED
-
+// sQ_pi / sK_pi are position-independent swizzle views; cute/tensor.hpp is
+// included unconditionally above so this section is always parsed.
 namespace flash {
 
 // sQ_pi / sK_pi are position-independent swizzle views shaped (M, D) / (N, D).
@@ -95,5 +94,3 @@ CUTLASS_DEVICE void gemm_qk_cofda_emu(TiledMma const& tiled_mma,
 }
 
 }  // namespace flash
-
-#endif  // CUTE_TENSOR_HPP_INCLUDED
