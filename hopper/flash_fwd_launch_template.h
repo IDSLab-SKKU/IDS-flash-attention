@@ -237,11 +237,13 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
                                         // Per-call runtime choice between two-level (false) and no-two-level (true).
                                         // Only instantiated for FP8 because of the surrounding `if constexpr (Is_FP8)`.
                                         BOOL_SWITCH(params.fp8_no_two_level_accum, DisableFP8TwoLevel, [&] {
-                                            // QK CoFDA emulation is compile-expensive (per-element software MMA, 3x
-                                            // instantiation). Only instantiate it for kHeadDim <= 128 — the configs the
-                                            // emulation is intended for. For larger head dims, always use the hardware
-                                            // path (qk_emu_enabled is rejected for kHeadDim > 128 in mha_fwd validation).
-                                            if constexpr (kHeadDim <= 128) {
+                                            // QK CoFDA emulation is only instantiated for kHeadDim == 128. It is
+                                            // validated bit-exact + deterministic vs the hardware FP8 QK MMA there.
+                                            // Other head dims either use a different tile (kBlockM=192 for d<=64,
+                                            // where the emulation is currently non-deterministic) or are unused;
+                                            // they always take the hardware path. qk_emu_enabled is rejected for
+                                            // d != 128 in mha_fwd validation.
+                                            if constexpr (kHeadDim == 128) {
                                                 if (params.qk_emu_enabled && params.qk_emu_fbits == 13) {
                                                     run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, Use_one_mma_wg, kBlockH, DisableFP8TwoLevel, /*UseQKEmu=*/true, /*QKEmuFbits=*/13>(params, stream);
                                                 } else if (params.qk_emu_enabled) {  // f_bits == 25 (validated upstream in mha_fwd)

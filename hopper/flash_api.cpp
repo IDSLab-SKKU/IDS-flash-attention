@@ -1052,8 +1052,9 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
                     "qk_emu_enabled requires SM90 (Hopper)");
         TORCH_CHECK(qk_emu_fbits == 13 || qk_emu_fbits == 25,
                     "qk_emu_fbits must be 13 or 25, got ", qk_emu_fbits);
-        TORCH_CHECK(params.d <= 128,
-                    "qk_emu_enabled is only supported for head_dim <= 128 (compile-cost guard), got d=", params.d);
+        TORCH_CHECK(params.d == 128,
+                    "qk_emu_enabled is only supported for head_dim == 128 (the only "
+                    "config validated bit-exact vs hardware; d<=64 is non-deterministic), got d=", params.d);
     }
 
     bool const use_dynamic_split = use_prepare_varlen && params.b <= PREPARE_VARLEN_MAX_BATCHES_1CTA && params.num_splits > 1;
