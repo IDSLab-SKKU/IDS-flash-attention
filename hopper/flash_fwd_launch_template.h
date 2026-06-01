@@ -44,7 +44,16 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static constexpr int kBlockM = Arch >= 90 ? std::get<0>(kBlockMN_RS_IntraWGOverlap) : std::get<0>(kBlockMN_kNWarps_Stages_RS);
     static constexpr int kBlockN = Arch >= 90 ? std::get<1>(kBlockMN_RS_IntraWGOverlap) : std::get<1>(kBlockMN_kNWarps_Stages_RS);
     static constexpr bool MmaPV_is_RS = std::get<2>(kBlockMN_RS_IntraWGOverlap);
-    static constexpr bool IntraWGOverlap = std::get<3>(kBlockMN_RS_IntraWGOverlap);
+    // The synchronous QK CoFDA emulation is incompatible with the IntraWGOverlap
+    // pipeline: that path overlaps the QK/PV gemms and defers K's consumer_release
+    // past the PV gemm, with the two MMA warpgroups decoupled by the ping-pong
+    // scheduler barrier. The hardware async WGMMA tolerates this; the synchronous
+    // emu does not, and the K producer overwrites smem stages the emu is still
+    // reading (a non-deterministic race that diverges from hardware for long
+    // context). Route the emulation through the simpler non-overlapped path, which
+    // waits for K on every warpgroup and releases K immediately after the QK gemm.
+    // Emulation is correctness-first, so the lost overlap (perf) is irrelevant.
+    static constexpr bool IntraWGOverlap = !UseQKEmu && std::get<3>(kBlockMN_RS_IntraWGOverlap);
     static constexpr int kNWarps = std::get<2>(kBlockMN_kNWarps_Stages_RS);
     static constexpr int kStages = Arch >= 90 ? 2 : std::get<3>(kBlockMN_kNWarps_Stages_RS);
     static constexpr bool Q_in_regs = Arch >= 90 ? false : std::get<4>(kBlockMN_kNWarps_Stages_RS);
@@ -75,7 +84,16 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // However, if Varlen (e.g., during decode where we have max_seqlens), using PersistentScheduler is better
     // since we'll avoid launching a bunch of thread blocks that immediately exit.
     // On Sm80, noncausal persistent seems a bit slower.
-    static constexpr bool UsePersistentScheduler = Arch >= 90 ? !(Split && !Varlen) : ((Is_causal && !Varlen) || (Varlen && Split));
+    // The synchronous QK CoFDA emulation must NOT use the persistent scheduler.
+    // With persistence a CTA processes multiple m_blocks back-to-back, double-
+    // buffering smem across them (work_idx parity); combined with a long KV loop
+    // the slow synchronous emu races against that cross-m_block buffering (a
+    // non-deterministic data race that diverges from hardware for long context).
+    // Empirically the bug needs BOTH many m_blocks AND many KV-blocks; a single
+    // m_block per CTA is bit-exact. The SingleTileScheduler gives exactly that,
+    // putting every m_block in the proven-correct regime. Emulation is
+    // correctness-first, so the lost persistence (perf) is irrelevant.
+    static constexpr bool UsePersistentScheduler = !UseQKEmu && (Arch >= 90 ? !(Split && !Varlen) : ((Is_causal && !Varlen) || (Varlen && Split)));
     using Scheduler = std::conditional_t<!UsePersistentScheduler, SchedulerSingleTile, SchedulerPersistent>;
     using AttnKernel = std::conditional_t<
         Arch >= 90,
