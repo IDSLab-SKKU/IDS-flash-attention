@@ -82,6 +82,8 @@ CUTLASS_DEVICE void gemm_qk_cofda_emu(TiledMma const& tiled_mma,
   Tensor tScS = thr_mma.partition_C(cS);   // same layout/size as tSrS
   CUTE_STATIC_ASSERT_V(size(tScS) == size(tSrS));
   const int D = size<1>(sQ_pi);            // kHeadDim
+  static_assert(decltype(size<1>(sQ_pi))::value % 32 == 0,
+                "kHeadDim must be a multiple of CHUNK=32 for CoFDA emulation");
   #pragma unroll
   for (int i = 0; i < size(tSrS); ++i) {
     auto coord = tScS(i);                  // (m, n)

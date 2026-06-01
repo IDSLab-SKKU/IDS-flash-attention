@@ -42,6 +42,10 @@ int main() {
   cudaMemcpy(dK, hK.data(), hK.size() * sizeof(__nv_fp8_e4m3), cudaMemcpyHostToDevice);
   run_dot<25><<<M, N>>>(dQ, dK, dS, M, N, D);
   cudaDeviceSynchronize();
+  {
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) { printf("CUDA ERROR: %s\n", cudaGetErrorString(err)); return 1; }
+  }
   std::vector<float> S(M * N);
   cudaMemcpy(S.data(), dS, M * N * sizeof(float), cudaMemcpyDeviceToHost);
 
@@ -62,6 +66,10 @@ int main() {
   cudaMalloc(&dS13, M * N * sizeof(float));
   run_dot<13><<<M, N>>>(dQ, dK, dS13, M, N, D);
   cudaDeviceSynchronize();
+  {
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) { printf("CUDA ERROR: %s\n", cudaGetErrorString(err)); return 1; }
+  }
   std::vector<float> S13(M * N);
   cudaMemcpy(S13.data(), dS13, M * N * sizeof(float), cudaMemcpyDeviceToHost);
 
