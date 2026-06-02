@@ -52,7 +52,10 @@ def _flash_attn_forward(
         s_aux=None,
         cp_world_size=1,
         cp_rank=0,
-        cp_tot_seqused_k=None):
+        cp_tot_seqused_k=None,
+        fp8_no_two_level_accum=False,
+        qk_emu_enabled=False,
+        qk_emu_fbits=25):
     q, k, k_new, v_new = [maybe_contiguous(x) for x in (q, k, k_new, v_new)]
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
     cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new = [
@@ -102,6 +105,9 @@ def _flash_attn_forward(
         cp_world_size,
         cp_rank,
         cp_tot_seqused_k,
+        fp8_no_two_level_accum,
+        qk_emu_enabled,
+        qk_emu_fbits,
     )
     return out, softmax_lse, *rest
 
@@ -269,6 +275,8 @@ class FlashAttnFunc(torch.autograd.Function):
         cp_world_size=1,
         cp_rank=0,
         cp_tot_seqused_k=None,
+        qk_emu_enabled=False,
+        qk_emu_fbits=25,
     ):
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
@@ -297,6 +305,8 @@ class FlashAttnFunc(torch.autograd.Function):
             cp_world_size=cp_world_size,
             cp_rank=cp_rank,
             cp_tot_seqused_k=cp_tot_seqused_k,
+            qk_emu_enabled=qk_emu_enabled,
+            qk_emu_fbits=qk_emu_fbits,
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
         ctx.save_for_backward(q, k, v, out, softmax_lse)
@@ -335,7 +345,7 @@ class FlashAttnFunc(torch.autograd.Function):
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -366,6 +376,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         cp_world_size=1,
         cp_rank=0,
         cp_tot_seqused_k=0,
+        qk_emu_enabled=False,
+        qk_emu_fbits=25,
     ):
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
@@ -398,6 +410,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             cp_world_size=cp_world_size,
             cp_rank=cp_rank,
             cp_tot_seqused_k=cp_tot_seqused_k,
+            qk_emu_enabled=qk_emu_enabled,
+            qk_emu_fbits=qk_emu_fbits,
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
@@ -441,7 +455,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_qkvpacked_func(
@@ -518,6 +532,8 @@ def flash_attn_func(
     cp_world_size=1,
     cp_rank=0,
     cp_tot_seqused_k=None,
+    qk_emu_enabled=False,
+    qk_emu_fbits=25,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -582,6 +598,8 @@ def flash_attn_func(
         cp_world_size,
         cp_rank,
         cp_tot_seqused_k,
+        qk_emu_enabled,
+        qk_emu_fbits,
     )
 
 
@@ -609,6 +627,8 @@ def flash_attn_varlen_func(
     cp_world_size=1,
     cp_rank=0,
     cp_tot_seqused_k=None,
+    qk_emu_enabled=False,
+    qk_emu_fbits=25,
 ):
     return FlashAttnVarlenFunc.apply(
         q,
@@ -634,6 +654,8 @@ def flash_attn_varlen_func(
         cp_world_size,
         cp_rank,
         cp_tot_seqused_k,
+        qk_emu_enabled,
+        qk_emu_fbits,
     )
 
 

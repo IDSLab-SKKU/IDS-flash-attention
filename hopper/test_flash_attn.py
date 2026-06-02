@@ -1212,3 +1212,40 @@ def test_flash_attn_combine(num_splits, seqlen, d, dtype):
     # # pytorch_profiler(torch.sum, lse_partial)
     # pytorch_profiler(flash_attn_combine, out_partial, lse_partial)
     # pytorch_profiler(torch.sum, out_partial)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
+    reason="QK CoFDA emulation requires SM90 (Hopper)",
+)
+@pytest.mark.parametrize("d", [64, 128])
+def test_qk_emu_parity_and_signal(d):
+    """F=25 emulation ~= hardware QK; F=13 diverges more but stays bounded."""
+    torch.manual_seed(0)
+    b, s, h = 1, 256, 4
+    def mk():
+        return (
+            torch.randn(b, s, h, d, device="cuda", dtype=torch.bfloat16)
+            .to(torch.float8_e4m3fn)
+        )
+    q, k, v = mk(), mk(), mk()
+    descale = torch.ones(1, device="cuda", dtype=torch.float32)
+    common = dict(
+        softmax_scale=d ** -0.5,
+        causal=True,
+        q_descale=descale,
+        k_descale=descale,
+        v_descale=descale,
+    )
+    out_hw = flash_attn_func(q, k, v, **common, qk_emu_enabled=False)
+    out_f25 = flash_attn_func(q, k, v, **common, qk_emu_enabled=True, qk_emu_fbits=25)
+    out_f13 = flash_attn_func(q, k, v, **common, qk_emu_enabled=True, qk_emu_fbits=13)
+    # flash_attn_func may return a tuple (out, lse); take the output tensor.
+    out_hw = out_hw[0] if isinstance(out_hw, (tuple, list)) else out_hw
+    out_f25 = out_f25[0] if isinstance(out_f25, (tuple, list)) else out_f25
+    out_f13 = out_f13[0] if isinstance(out_f13, (tuple, list)) else out_f13
+    err25 = (out_f25.float() - out_hw.float()).abs().mean().item()
+    err13 = (out_f13.float() - out_hw.float()).abs().mean().item()
+    assert err25 < 5e-2, f"F25 parity too loose vs hardware: {err25}"
+    assert err13 > err25, f"F13 should diverge more than F25: {err13} vs {err25}"
+    assert err13 < 1.0, f"F13 divergence unbounded: {err13}"

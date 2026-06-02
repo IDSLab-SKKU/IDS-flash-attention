@@ -23,6 +23,7 @@
 #include "rotary.h"
 #include "utils.h"
 #include "sm90_pipeline_no_cluster.hpp"
+#include "gemm_qk_cofda_emu.h"
 
 namespace flash {
 
@@ -31,7 +32,7 @@ using namespace cute;
 template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
         bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, class ElementSAux_, int kBlockH_=1,
-        bool DisableFP8TwoLevel_=false>
+        bool DisableFP8TwoLevel_=false, bool UseQKEmu_=false, int QKEmuFbits_=25>
 struct CollectiveMainloopFwdSm90 {
 
     static constexpr int kStages = Stages;
@@ -45,6 +46,10 @@ struct CollectiveMainloopFwdSm90 {
     using ArchTag = ArchTag_;
     static constexpr bool Is_FP8 = cute::is_same_v<Element, cutlass::float_e4m3_t> || cute::is_same_v<Element, cutlass::float_e5m2_t>;;
     static constexpr bool DisableFP8TwoLevel = DisableFP8TwoLevel_;
+    static constexpr bool UseQKEmu = UseQKEmu_;
+    static constexpr int QKEmuFbits = QKEmuFbits_;
+    static_assert(!UseQKEmu || cute::is_same_v<Element, cutlass::float_e4m3_t>,
+                  "QK CoFDA emulation requires FP8 e4m3 element type");
     static constexpr bool Is_causal = Is_causal_;
     static constexpr bool Is_local = Is_local_;
     static constexpr bool Has_softcap = Has_softcap_;
@@ -1214,8 +1219,15 @@ struct CollectiveMainloopFwdSm90 {
         if constexpr (IntraWGOverlap) {
             Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
             consumer_wait(pipeline_k, smem_pipe_read);
-            flash::gemm</*zero_init=*/true, /*wg_wait=*/-1, /*SwapAB=*/false, /*M_slice=*/-1, /*DisableFP8TwoLevel=*/DisableFP8TwoLevel>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
-            warpgroup_wait<0>();
+            if constexpr (UseQKEmu) {
+                // Software CoFDA emulation of S=Q·Kᵀ (synchronous; replaces the QK WGMMA).
+                Tensor sQ_pi = cute::as_position_independent_swizzle_tensor(sQ);
+                Tensor sK_pi = cute::as_position_independent_swizzle_tensor(sK);
+                flash::gemm_qk_cofda_emu<QKEmuFbits>(tiled_mma_qk, sQ_pi, sK_pi(_, _, smem_pipe_read.index()), tSrS, thread_idx);
+            } else {
+                flash::gemm</*zero_init=*/true, /*wg_wait=*/-1, /*SwapAB=*/false, /*M_slice=*/-1, /*DisableFP8TwoLevel=*/DisableFP8TwoLevel>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+            }
+            if constexpr (!UseQKEmu) { warpgroup_wait<0>(); }   // emu path is synchronous; no pending QK WGMMA
             pipeline_k.consumer_release(smem_pipe_read);
             if constexpr (HasQv) {
                 shared_storage.pipelines.barrier_Qv.wait(work_idx % 2);
@@ -1250,7 +1262,14 @@ struct CollectiveMainloopFwdSm90 {
                 Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
                 if (!UseSchedulerBarrier || warp_group_idx == 0) { consumer_wait(pipeline_k, smem_pipe_read); }
                 warp_scheduler_barrier_sync();
-                flash::gemm</*zero_init=*/true, /*wg_wait=*/-1, /*SwapAB=*/false, /*M_slice=*/-1, /*DisableFP8TwoLevel=*/DisableFP8TwoLevel>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+                if constexpr (UseQKEmu) {
+                    // Software CoFDA emulation of S=Q·Kᵀ (synchronous; replaces the QK WGMMA).
+                    Tensor sQ_pi = cute::as_position_independent_swizzle_tensor(sQ);
+                    Tensor sK_pi = cute::as_position_independent_swizzle_tensor(sK);
+                    flash::gemm_qk_cofda_emu<QKEmuFbits>(tiled_mma_qk, sQ_pi, sK_pi(_, _, smem_pipe_read.index()), tSrS, thread_idx);
+                } else {
+                    flash::gemm</*zero_init=*/true, /*wg_wait=*/-1, /*SwapAB=*/false, /*M_slice=*/-1, /*DisableFP8TwoLevel=*/DisableFP8TwoLevel>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+                }
                 if constexpr (RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
                 if constexpr(!HasQv) {
                     if (!UseSchedulerBarrier || warp_group_idx == 0) { consumer_wait(pipeline_v, smem_pipe_read_v); }
@@ -1353,10 +1372,31 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (!Is_first_iter) { ++smem_pipe_read; }
                 Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
                 consumer_wait(pipeline_k, smem_pipe_read);
-                flash::gemm</*zero_init=*/true, /*wg_wait=*/-1, /*SwapAB=*/false, /*M_slice=*/-1, /*DisableFP8TwoLevel=*/DisableFP8TwoLevel>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+                if constexpr (UseQKEmu) {
+                    // Software CoFDA emulation of S=Q·Kᵀ (synchronous; replaces the QK WGMMA).
+                    Tensor sQ_pi = cute::as_position_independent_swizzle_tensor(sQ);
+                    Tensor sK_pi = cute::as_position_independent_swizzle_tensor(sK);
+                    flash::gemm_qk_cofda_emu<QKEmuFbits>(tiled_mma_qk, sQ_pi, sK_pi(_, _, smem_pipe_read.index()), tSrS, thread_idx);
+                } else {
+                    flash::gemm</*zero_init=*/true, /*wg_wait=*/-1, /*SwapAB=*/false, /*M_slice=*/-1, /*DisableFP8TwoLevel=*/DisableFP8TwoLevel>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+                }
                 if constexpr (!HasQv) {
                     warp_scheduler_barrier_arrive();
-                    warpgroup_wait<0>();
+                    if constexpr (!UseQKEmu) {
+                        warpgroup_wait<0>();   // emu path is synchronous; no pending QK WGMMA
+                    } else {
+                        // CONFIRMED root cause (uniform-K experiment): the emu reads K via
+                        // synchronous LDS, and consumer_release is COLLECTIVE -- the K producer
+                        // overwrites this stage once all NumMmaThreadsQK threads have arrived, so a
+                        // straggler thread can still be mid-read (a per-thread fence is NOT enough).
+                        // Sync each QK MMA warpgroup (the granularity consumer_release assumes is
+                        // already synchronized) so every thread has finished reading K before this
+                        // warpgroup releases the stage. Distinct barrier id per WG (AppendKV /
+                        // QueryRotated, both idle inside the main KV loop) so the scheduler ping-pong
+                        // offset between the two WGs cannot mis-pair a full-population barrier.
+                        cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup,
+                            static_cast<uint32_t>(FwdNamedBarriers::AppendKV) - 1 + flash::canonical_warp_group_idx_nosync());
+                    }
                     pipeline_k.consumer_release(smem_pipe_read);  // release K
                 } else {
                     if constexpr (Is_first_iter) {
