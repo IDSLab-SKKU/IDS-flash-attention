@@ -1382,7 +1382,21 @@ struct CollectiveMainloopFwdSm90 {
                 }
                 if constexpr (!HasQv) {
                     warp_scheduler_barrier_arrive();
-                    if constexpr (!UseQKEmu) { warpgroup_wait<0>(); }   // emu path is synchronous; no pending QK WGMMA
+                    if constexpr (!UseQKEmu) {
+                        warpgroup_wait<0>();   // emu path is synchronous; no pending QK WGMMA
+                    } else {
+                        // CONFIRMED root cause (uniform-K experiment): the emu reads K via
+                        // synchronous LDS, and consumer_release is COLLECTIVE -- the K producer
+                        // overwrites this stage once all NumMmaThreadsQK threads have arrived, so a
+                        // straggler thread can still be mid-read (a per-thread fence is NOT enough).
+                        // Sync each QK MMA warpgroup (the granularity consumer_release assumes is
+                        // already synchronized) so every thread has finished reading K before this
+                        // warpgroup releases the stage. Distinct barrier id per WG (AppendKV /
+                        // QueryRotated, both idle inside the main KV loop) so the scheduler ping-pong
+                        // offset between the two WGs cannot mis-pair a full-population barrier.
+                        cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup,
+                            static_cast<uint32_t>(FwdNamedBarriers::AppendKV) - 1 + flash::canonical_warp_group_idx_nosync());
+                    }
                     pipeline_k.consumer_release(smem_pipe_read);  // release K
                 } else {
                     if constexpr (Is_first_iter) {
