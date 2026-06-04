@@ -2,7 +2,7 @@
 //
 // Software CoFDA FP8 emulation of S = Q·Kᵀ for flash-attention's SM90 forward
 // kernel.  Two parts:
-//   (a)  cofda_dot<F>(fa, fb, D)  — numeric core, decoupled from operand LAYOUT.
+//   (a)  cofda_dot_acc<F>(...) — seeded numeric core; cofda_dot<F>(...) zero-seeded wrapper.
 //   (b)  flash::gemm_qk_cofda_emu — kernel entry that reads raw FP8 Q/K from
 //        SWIZZLED smem tensors.  Requires CuTe.
 //
@@ -37,13 +37,15 @@ __device__ __forceinline__ uint8_t fp8_bits(E const& e) {
 // F controls the number of fractional bits in the CoFDA accumulator:
 //   F=25 ≈ FP32 precision (tight tolerance vs FP32 reference)
 //   F=13 uses a restricted accumulator that visibly diverges
+// Seeded numeric core: accumulate fa·fb over D into a CoFDA-F accumulator that
+// STARTS at acc_init (used by PV to model the hardware's continuous FP32
+// accumulator carried across KV blocks). D must be a multiple of CHUNK=32.
 template <int F, class FetchA, class FetchB>
-__device__ float cofda_dot(FetchA fa, FetchB fb, int D) {
+__device__ float cofda_dot_acc(FetchA fa, FetchB fb, int D, float acc_init) {
   constexpr int CHUNK = 32;
   assert(D % 32 == 0);
-  // Decoded operands in registers (NOT smem — one chunk at a time)
   uint32_t a_dec[CHUNK], b_dec[CHUNK];
-  float acc = 0.f;
+  float acc = acc_init;
   for (int base = 0; base < D; base += CHUNK) {
     #pragma unroll
     for (int j = 0; j < CHUNK; ++j) {
@@ -52,11 +54,15 @@ __device__ float cofda_dot(FetchA fa, FetchB fb, int D) {
     }
     vllm::cair::DecodedFrag a_frag{a_dec};
     vllm::cair::DecodedFrag b_frag{b_dec};
-    // fp8_cofda_mma<F, CHUNK_SIZE>(a_frag, b_frag, acc) — chunked accumulate
-    // with intermediate rounding; CHUNK_SIZE must be 32 (cair slice-1 only).
     acc = vllm::cair::fp8_cofda_mma<F, CHUNK>(a_frag, b_frag, acc);
   }
   return acc;
+}
+
+// Zero-seeded form (QK uses this; behavior unchanged).
+template <int F, class FetchA, class FetchB>
+__device__ float cofda_dot(FetchA fa, FetchB fb, int D) {
+  return cofda_dot_acc<F>(fa, fb, D, 0.f);
 }
 
 // --- (b) Kernel entry: replace the QK WGMMA. Reads raw FP8 Q/K from SWIZZLED smem.
