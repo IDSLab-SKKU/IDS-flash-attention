@@ -24,6 +24,7 @@
 #include "utils.h"
 #include "sm90_pipeline_no_cluster.hpp"
 #include "gemm_qk_cofda_emu.h"
+#include "gemm_pv_cofda_emu.h"
 
 namespace flash {
 
@@ -1434,6 +1435,32 @@ struct CollectiveMainloopFwdSm90 {
                 Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
                 if constexpr (LargeHeadDimV && !Is_first_iter) { store_scales(scores_scale, smem_pipe_read_prev.index()); }
                 softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
+                if constexpr (UsePVEmu) {
+                    // Stage P (softmax probs) to smem for the CoFDA emulation BEFORE the FP8
+                    // permute, while tSrS is still in the clean QK accumulator (m,n) layout.
+                    // P is register-source here (MmaPV_is_RS), but the emu needs arbitrary
+                    // P[m,k] from any thread, so we stage to smem. Convert fp32->e4m3 with the
+                    // SAME converter as the hardware path (convert_type_out) and scalar-write by
+                    // (m,k) coordinate -- the STSM-based write_P_to_smem does not vectorize for
+                    // the FP8 register-source P layout.
+                    Tensor tPrP = make_tensor_like<Element>(tSrS);
+                    convert_type_out(tSrS, tPrP);
+                    Tensor sP_pi_w = cute::as_position_independent_swizzle_tensor(sP);
+                    Tensor cP = cute::make_identity_tensor(select<0, 1>(TileShape_MNK{}));
+                    Tensor tPcP = tiled_mma_qk.get_thread_slice(thread_idx).partition_C(cP);
+                    CUTE_STATIC_ASSERT_V(size(tPcP) == size(tPrP));
+                    #pragma unroll
+                    for (int i = 0; i < size(tPrP); ++i) {
+                        sP_pi_w(get<0>(tPcP(i)), get<1>(tPcP(i))) = tPrP(i);
+                    }
+                    // Full-warpgroup ordering: the emu reads sP(m,k) written by OTHER threads in
+                    // this warpgroup (the P-fragment owner differs from the O-fragment owner), so
+                    // __syncwarp is insufficient -- use a per-WG NamedBarrier (AppendKV id, idle
+                    // in the main KV loop; distinct per WG so the ping-pong can't mis-pair it).
+                    cutlass::arch::fence_view_async_shared();
+                    cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup,
+                        static_cast<uint32_t>(FwdNamedBarriers::AppendKV) - 1 + flash::canonical_warp_group_idx_nosync());
+                }
                 if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
                 Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMmaPV>(tSrS.layout()));
                 Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
@@ -1444,14 +1471,31 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (!MmaPV_is_RS && !MmaPV_use_RS_WG1) { arrive_on_P_write_barrier(); }
                 if constexpr (!HasQv) { consumer_wait(pipeline_v, smem_pipe_read); }
                 warp_scheduler_barrier_sync();
-                if constexpr (!MmaPV_use_RS_WG1) {
+                if constexpr (UsePVEmu) {
+                    // Software CoFDA emulation of O=P.V (synchronous; replaces the PV WGMMA).
+                    // tOrO is seeded inside the emu (ZeroInit==Is_first_iter); the rescale above
+                    // already applied for non-first iters.
+                    Tensor sP_pi = cute::as_position_independent_swizzle_tensor(sP);
+                    Tensor sV_pi = cute::as_position_independent_swizzle_tensor(sV);
+                    flash::gemm_pv_cofda_emu<PVEmuFbits, /*ZeroInit=*/Is_first_iter>(
+                        tiled_mma_pv, sP_pi, sV_pi(_, _, smem_pipe_read.index()), tOrO, thread_idx);
+                } else if constexpr (!MmaPV_use_RS_WG1) {
                     flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1, /*SwapAB=*/false, /*M_slice=*/-1, /*DisableFP8TwoLevel=*/DisableFP8TwoLevel>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
                 } else {
                     TiledMmaPV_RS tiled_mma_pv_rs;
                     flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1, /*SwapAB=*/false, /*M_slice=*/-1, /*DisableFP8TwoLevel=*/DisableFP8TwoLevel>(tiled_mma_pv_rs, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
                 }
                 if constexpr (!MmaPV_is_RS && MmaPV_use_RS_WG1) { arrive_on_P_write_barrier(); }
-                warpgroup_wait<0>();
+                if constexpr (!UsePVEmu) {
+                    warpgroup_wait<0>();
+                } else {
+                    // The emu reads V via synchronous LDS; consumer_release is COLLECTIVE,
+                    // so a straggler thread can still be mid-read when the V producer reuses
+                    // the stage (the QK long-context race, applied to V). Per-WG NamedBarrier
+                    // so every thread finished reading V before this WG releases the stage.
+                    cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup,
+                        static_cast<uint32_t>(FwdNamedBarriers::AppendKV) - 1 + flash::canonical_warp_group_idx_nosync());
+                }
                 pipeline_v.consumer_release(smem_pipe_read);  // release V
             };
 
