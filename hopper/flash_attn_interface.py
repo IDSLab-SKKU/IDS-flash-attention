@@ -55,7 +55,9 @@ def _flash_attn_forward(
         cp_tot_seqused_k=None,
         fp8_no_two_level_accum=False,
         qk_emu_enabled=False,
-        qk_emu_fbits=25):
+        qk_emu_fbits=25,
+        pv_emu_enabled=False,
+        pv_emu_fbits=25):
     q, k, k_new, v_new = [maybe_contiguous(x) for x in (q, k, k_new, v_new)]
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
     cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new = [
@@ -108,6 +110,8 @@ def _flash_attn_forward(
         fp8_no_two_level_accum,
         qk_emu_enabled,
         qk_emu_fbits,
+        pv_emu_enabled,
+        pv_emu_fbits,
     )
     return out, softmax_lse, *rest
 
@@ -277,6 +281,8 @@ class FlashAttnFunc(torch.autograd.Function):
         cp_tot_seqused_k=None,
         qk_emu_enabled=False,
         qk_emu_fbits=25,
+        pv_emu_enabled=False,
+        pv_emu_fbits=25,
     ):
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
@@ -307,6 +313,8 @@ class FlashAttnFunc(torch.autograd.Function):
             cp_tot_seqused_k=cp_tot_seqused_k,
             qk_emu_enabled=qk_emu_enabled,
             qk_emu_fbits=qk_emu_fbits,
+            pv_emu_enabled=pv_emu_enabled,
+            pv_emu_fbits=pv_emu_fbits,
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
         ctx.save_for_backward(q, k, v, out, softmax_lse)
@@ -378,6 +386,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         cp_tot_seqused_k=0,
         qk_emu_enabled=False,
         qk_emu_fbits=25,
+        pv_emu_enabled=False,
+        pv_emu_fbits=25,
     ):
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
@@ -412,6 +422,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             cp_tot_seqused_k=cp_tot_seqused_k,
             qk_emu_enabled=qk_emu_enabled,
             qk_emu_fbits=qk_emu_fbits,
+            pv_emu_enabled=pv_emu_enabled,
+            pv_emu_fbits=pv_emu_fbits,
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
@@ -534,6 +546,8 @@ def flash_attn_func(
     cp_tot_seqused_k=None,
     qk_emu_enabled=False,
     qk_emu_fbits=25,
+    pv_emu_enabled=False,
+    pv_emu_fbits=25,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -600,6 +614,8 @@ def flash_attn_func(
         cp_tot_seqused_k,
         qk_emu_enabled,
         qk_emu_fbits,
+        pv_emu_enabled,
+        pv_emu_fbits,
     )
 
 
@@ -629,6 +645,8 @@ def flash_attn_varlen_func(
     cp_tot_seqused_k=None,
     qk_emu_enabled=False,
     qk_emu_fbits=25,
+    pv_emu_enabled=False,
+    pv_emu_fbits=25,
 ):
     return FlashAttnVarlenFunc.apply(
         q,
@@ -656,6 +674,8 @@ def flash_attn_varlen_func(
         cp_tot_seqused_k,
         qk_emu_enabled,
         qk_emu_fbits,
+        pv_emu_enabled,
+        pv_emu_fbits,
     )
 
 
