@@ -748,7 +748,9 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         std::optional<const at::Tensor> &cp_tot_seqused_k_, // b. total seqused_k in cp world
         bool fp8_no_two_level_accum,
         bool qk_emu_enabled,
-        int64_t qk_emu_fbits
+        int64_t qk_emu_fbits,
+        bool pv_emu_enabled,
+        int64_t pv_emu_fbits
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -1054,6 +1056,19 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
                     "qk_emu_fbits must be 13 or 25, got ", qk_emu_fbits);
         TORCH_CHECK(params.d == 128,
                     "qk_emu_enabled is only supported for head_dim == 128 (the only "
+                    "config validated bit-exact vs hardware; d<=64 is non-deterministic), got d=", params.d);
+    }
+    params.pv_emu_enabled = pv_emu_enabled;
+    params.pv_emu_fbits = static_cast<int>(pv_emu_fbits);
+    if (pv_emu_enabled) {
+        TORCH_CHECK(q_type == at::ScalarType::Float8_e4m3fn,
+                    "pv_emu_enabled requires e4m3 (Float8_e4m3fn) query/key dtype");
+        TORCH_CHECK(dprops->major == 9,
+                    "pv_emu_enabled requires SM90 (Hopper)");
+        TORCH_CHECK(pv_emu_fbits == 13 || pv_emu_fbits == 25,
+                    "pv_emu_fbits must be 13 or 25, got ", pv_emu_fbits);
+        TORCH_CHECK(params.d == 128,
+                    "pv_emu_enabled is only supported for head_dim == 128 (the only "
                     "config validated bit-exact vs hardware; d<=64 is non-deterministic), got d=", params.d);
     }
 
