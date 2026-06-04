@@ -261,31 +261,27 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
                                             // different tile (kBlockM=192 for d<=64, where the emulation is currently
                                             // non-deterministic) or are unused; they always take the hardware path.
                                             // {qk,pv}_emu_enabled are rejected for d != 128 in mha_fwd validation.
-                                            auto dispatch_pv = [&](auto UseQKEmu_c, auto QKFbits_c) {
-                                                constexpr bool UseQKEmu = decltype(UseQKEmu_c)::value;
-                                                constexpr int  QKEmuFbits = decltype(QKFbits_c)::value;
-                                                if constexpr (kHeadDim == 128) {
-                                                    if (params.pv_emu_enabled && params.pv_emu_fbits == 13) {
-                                                        run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, Use_one_mma_wg, kBlockH, DisableFP8TwoLevel, UseQKEmu, QKEmuFbits, /*UsePVEmu=*/true, /*PVEmuFbits=*/13>(params, stream);
-                                                    } else if (params.pv_emu_enabled) {  // pv f_bits == 25 (validated upstream in mha_fwd)
-                                                        run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, Use_one_mma_wg, kBlockH, DisableFP8TwoLevel, UseQKEmu, QKEmuFbits, /*UsePVEmu=*/true, /*PVEmuFbits=*/25>(params, stream);
-                                                    } else {
-                                                        run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, Use_one_mma_wg, kBlockH, DisableFP8TwoLevel, UseQKEmu, QKEmuFbits, /*UsePVEmu=*/false, /*PVEmuFbits=*/25>(params, stream);
-                                                    }
-                                                } else {
-                                                    run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, Use_one_mma_wg, kBlockH, DisableFP8TwoLevel, UseQKEmu, QKEmuFbits, /*UsePVEmu=*/false, /*PVEmuFbits=*/25>(params, stream);
-                                                }
-                                            };
-                                            if constexpr (kHeadDim == 128) {
+                                            // Emulation is instantiated ONLY for kHeadDim==128 AND DisableFP8TwoLevel
+                                            // (the validated no-two-level config) AND one axis at a time (QK xor PV).
+                                            // mha_fwd runtime-rejects (qk_emu && pv_emu) and (emu && !no_two_level),
+                                            // so unbuilt combos are never requested. This bounds the build-time
+                                            // cost (6 emu kernels per hdim128 e4m3 TU instead of the full
+                                            // two-level x QK x PV cross product). Both-emu / emu+two-level can be
+                                            // re-enabled later by widening this dispatch.
+                                            if constexpr (kHeadDim == 128 && DisableFP8TwoLevel) {
                                                 if (params.qk_emu_enabled && params.qk_emu_fbits == 13) {
-                                                    dispatch_pv(std::true_type{}, std::integral_constant<int, 13>{});
-                                                } else if (params.qk_emu_enabled) {  // qk f_bits == 25 (validated upstream in mha_fwd)
-                                                    dispatch_pv(std::true_type{}, std::integral_constant<int, 25>{});
+                                                    run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, Use_one_mma_wg, kBlockH, DisableFP8TwoLevel, /*UseQKEmu=*/true, /*QKEmuFbits=*/13, /*UsePVEmu=*/false, /*PVEmuFbits=*/25>(params, stream);
+                                                } else if (params.qk_emu_enabled) {  // qk f_bits == 25
+                                                    run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, Use_one_mma_wg, kBlockH, DisableFP8TwoLevel, /*UseQKEmu=*/true, /*QKEmuFbits=*/25, /*UsePVEmu=*/false, /*PVEmuFbits=*/25>(params, stream);
+                                                } else if (params.pv_emu_enabled && params.pv_emu_fbits == 13) {
+                                                    run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, Use_one_mma_wg, kBlockH, DisableFP8TwoLevel, /*UseQKEmu=*/false, /*QKEmuFbits=*/25, /*UsePVEmu=*/true, /*PVEmuFbits=*/13>(params, stream);
+                                                } else if (params.pv_emu_enabled) {  // pv f_bits == 25
+                                                    run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, Use_one_mma_wg, kBlockH, DisableFP8TwoLevel, /*UseQKEmu=*/false, /*QKEmuFbits=*/25, /*UsePVEmu=*/true, /*PVEmuFbits=*/25>(params, stream);
                                                 } else {
-                                                    dispatch_pv(std::false_type{}, std::integral_constant<int, 25>{});
+                                                    run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, Use_one_mma_wg, kBlockH, DisableFP8TwoLevel, /*UseQKEmu=*/false, /*QKEmuFbits=*/25, /*UsePVEmu=*/false, /*PVEmuFbits=*/25>(params, stream);
                                                 }
                                             } else {
-                                                dispatch_pv(std::false_type{}, std::integral_constant<int, 25>{});
+                                                run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, Use_one_mma_wg, kBlockH, DisableFP8TwoLevel, /*UseQKEmu=*/false, /*QKEmuFbits=*/25, /*UsePVEmu=*/false, /*PVEmuFbits=*/25>(params, stream);
                                             }
                                         });
                                     } else

@@ -1071,6 +1071,17 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
                     "pv_emu_enabled is only supported for head_dim == 128 (the only "
                     "config validated bit-exact vs hardware; d<=64 is non-deterministic), got d=", params.d);
     }
+    if (qk_emu_enabled || pv_emu_enabled) {
+        // Only the no-two-level emulation kernels are instantiated (the validated config),
+        // and only one emulation axis at a time. These combos are not built; reject them
+        // here so we never dispatch to a non-existent specialization.
+        TORCH_CHECK(fp8_no_two_level_accum,
+                    "qk_emu_enabled / pv_emu_enabled require fp8_no_two_level_accum=True "
+                    "(only the no-two-level emulation kernels are built)");
+        TORCH_CHECK(!(qk_emu_enabled && pv_emu_enabled),
+                    "qk_emu_enabled and pv_emu_enabled cannot be set simultaneously yet "
+                    "(only single-axis emulation kernels are built); enable one at a time");
+    }
 
     bool const use_dynamic_split = use_prepare_varlen && params.b <= PREPARE_VARLEN_MAX_BATCHES_1CTA && params.num_splits > 1;
     // disable split for varlen and >992 batches for now
