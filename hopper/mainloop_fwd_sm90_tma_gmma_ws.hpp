@@ -32,7 +32,8 @@ using namespace cute;
 template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
         bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, class ElementSAux_, int kBlockH_=1,
-        bool DisableFP8TwoLevel_=false, bool UseQKEmu_=false, int QKEmuFbits_=25>
+        bool DisableFP8TwoLevel_=false, bool UseQKEmu_=false, int QKEmuFbits_=25,
+        bool UsePVEmu_=false, int PVEmuFbits_=25>
 struct CollectiveMainloopFwdSm90 {
 
     static constexpr int kStages = Stages;
@@ -50,6 +51,10 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr int QKEmuFbits = QKEmuFbits_;
     static_assert(!UseQKEmu || cute::is_same_v<Element, cutlass::float_e4m3_t>,
                   "QK CoFDA emulation requires FP8 e4m3 element type");
+    static constexpr bool UsePVEmu = UsePVEmu_;
+    static constexpr int  PVEmuFbits = PVEmuFbits_;
+    static_assert(!UsePVEmu || cute::is_same_v<Element, cutlass::float_e4m3_t>,
+                  "PV CoFDA emulation is e4m3-only");
     static constexpr bool Is_causal = Is_causal_;
     static constexpr bool Is_local = Is_local_;
     static constexpr bool Has_softcap = Has_softcap_;
@@ -317,7 +322,7 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr size_t SmemAlignmentP = cutlass::detail::alignment_for_swizzle(SmemLayoutP{});
     static_assert(SmemAlignmentP >= 128, "Require at least 128B alignment");
 
-    using SmemP_t = std::conditional_t<MmaPV_is_RS, cute::array<Element, 0>, cute::array_aligned<Element, cute::cosize_v<SmemLayoutP>, SmemAlignmentP>>;
+    using SmemP_t = std::conditional_t<MmaPV_is_RS && !UsePVEmu, cute::array<Element, 0>, cute::array_aligned<Element, cute::cosize_v<SmemLayoutP>, SmemAlignmentP>>;
     using SmemScale_t = std::conditional_t<!LargeHeadDimV, cute::array<float, 0>, cute::array_aligned<float, cute::cosize_v<SmemLayoutScale>, 128>>;
     using SmemQv_t = std::conditional_t<!HasQv, cute::array<Element, 0>, cute::array_aligned<Element, cute::cosize_v<SmemLayoutQv>, SmemAlignmentQv>>;
     // Sometimes even with SmemP_t = cute::array<Element, 0>, putting it in the TensorStorage struct causes
@@ -368,7 +373,22 @@ struct CollectiveMainloopFwdSm90 {
         cute::array_aligned<ElementSAux, cute::cosize_v<SmemLayoutSAux>, 128> smem_s_aux;
     };
 
-    using TensorStorage = std::conditional_t<!Transpose_V, TensorStorageNoTranspose, TensorStorageTransposeV>;
+    // Emu-only variant: identical to TensorStorageTransposeV plus a real smem_p
+    // staging buffer for P. Selected only when UsePVEmu so the proven non-emu
+    // FP8 TransposeV smem layout stays byte-identical.
+    struct TensorStorageTransposeVWithP : cute::aligned_struct<cute::max(SmemAlignmentQ, SmemAlignmentK, SmemAlignmentV, SmemAlignmentP), _0> {
+        cute::array_aligned<Element, cute::cosize_v<SmemLayoutVtMma>, SmemAlignmentV> smem_v;
+        cute::array_aligned<Element, cute::cosize_v<SmemLayoutVt>, SmemAlignmentVt> smem_vt;
+        cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>, SmemAlignmentQ> smem_q;
+        cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>, SmemAlignmentK> smem_k;
+        SmemQv_t smem_qv;
+        SmemScale_t smem_scale;
+        SmemP_t smem_p;
+        cute::array_aligned<ElementSAux, cute::cosize_v<SmemLayoutSAux>, 128> smem_s_aux;
+    };
+
+    using TensorStorage = std::conditional_t<!Transpose_V, TensorStorageNoTranspose,
+        std::conditional_t<UsePVEmu, TensorStorageTransposeVWithP, TensorStorageTransposeV>>;
 
     // These are tuned for speed. They don't affect correctness.
     static constexpr bool UseSchedulerBarrier = (IntraWGOverlap
@@ -1031,8 +1051,8 @@ struct CollectiveMainloopFwdSm90 {
         Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});
         Tensor sV = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVtMma{});
         Tensor sP = [&] {
-            if constexpr (MmaPV_is_RS) {
-                // We might not have smem_p if !MmaPV_is_RS, just use smem_q as a placeholder since we don't use it
+            if constexpr (MmaPV_is_RS && !UsePVEmu) {
+                // placeholder: smem_q is unused as P storage on the pure-RS path
                 return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutP{});
             } else {
                 return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_p.data()), SmemLayoutP{});
