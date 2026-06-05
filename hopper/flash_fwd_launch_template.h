@@ -55,7 +55,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // Emulation is correctness-first, so the lost overlap (perf) is irrelevant.
     static constexpr bool IntraWGOverlap = !UseQKEmu && !UsePVEmu && std::get<3>(kBlockMN_RS_IntraWGOverlap);
     static constexpr int kNWarps = std::get<2>(kBlockMN_kNWarps_Stages_RS);
-    static constexpr int kStages = Arch >= 90 ? (UsePVEmu ? 1 : 2) : std::get<3>(kBlockMN_kNWarps_Stages_RS);
+    static constexpr int kStages = Arch >= 90 ? 2 : std::get<3>(kBlockMN_kNWarps_Stages_RS);
     static constexpr bool Q_in_regs = Arch >= 90 ? false : std::get<4>(kBlockMN_kNWarps_Stages_RS);
 
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
