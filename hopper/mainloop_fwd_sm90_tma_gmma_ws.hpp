@@ -67,7 +67,11 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr bool PackGQA_TMA = PackGQA && kBlockH_ > 1;
     static constexpr bool Split = Split_;
     static constexpr bool V_colmajor = V_colmajor_;
-    static constexpr bool Transpose_V = Is_FP8 && !V_colmajor;
+    // The PV CoFDA emulation replaces the PV WGMMA, so it does not need V transposed.
+    // Disabling Transpose_V keeps V in logical (headdim, seqlen) order in smem so the
+    // emulation can read V[k,n] by logical coordinate (the STSM transpose permutes the
+    // seqlen index, which misaligns P[m,k] with V[k,n] over the reduction).
+    static constexpr bool Transpose_V = Is_FP8 && !V_colmajor && !UsePVEmu;
     static constexpr bool Use_TMA_Q = !PackGQA || PackGQA_TMA;
     static constexpr bool Use_TMA_KV = !PagedKVNonTMA;
     static_assert(Use_TMA_KV || CUTE_STATIC_V(size(ClusterShape{})) == 1, "If not using TMA for KV, ClusterShape must be 1");
@@ -355,8 +359,11 @@ struct CollectiveMainloopFwdSm90 {
         cute::array_aligned<ElementSAux, cute::cosize_v<SmemLayoutSAux>, 128> smem_s_aux;
     };
 
+    // The PV emulation disables Transpose_V (so it takes this NoTranspose path) but still
+    // needs smem_p to stage P. MmaPV_is_RS is true for the emu, so exclude it here to force
+    // the WithP (smem_p-bearing) variant. SmemP_t is non-empty under UsePVEmu.
     using TensorStorageNoTranspose = std::conditional_t<
-        MmaPV_is_RS,
+        MmaPV_is_RS && !UsePVEmu,
         TensorStorageWithoutPNoTranspose,
         std::conditional_t<!LargeHeadDimV, TensorStorageWithPNoTranspose, TensorStorageWithPScaleNoTranspose>
     >;
@@ -1051,6 +1058,11 @@ struct CollectiveMainloopFwdSm90 {
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
         Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});
         Tensor sV = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVtMma{});
+        // PV emulation reads V in logical (headdim, seqlen) order. With Transpose_V disabled
+        // for the emu, smem_v holds V laid out per SmemLayoutVt (the TMA layout, no STSM
+        // transpose), so this is the correct view; SmemLayoutVtMma (used for sV/tOrV above)
+        // would mis-decode the non-transposed bytes. Only used when UsePVEmu.
+        Tensor sVemu = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVt{});
         Tensor sP = [&] {
             if constexpr (MmaPV_is_RS && !UsePVEmu) {
                 // placeholder: smem_q is unused as P storage on the pure-RS path
@@ -1474,9 +1486,11 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (UsePVEmu) {
                     // Software CoFDA emulation of O=P.V (synchronous; replaces the PV WGMMA).
                     // tOrO is seeded inside the emu (ZeroInit==Is_first_iter); the rescale above
-                    // already applied for non-first iters.
+                    // already applied for non-first iters. With Transpose_V disabled for the emu,
+                    // sVemu (SmemLayoutVt) holds V in logical (headdim, seqlen) order, so
+                    // sV_pi(n,k) == V[k,n].
                     Tensor sP_pi = cute::as_position_independent_swizzle_tensor(sP);
-                    Tensor sV_pi = cute::as_position_independent_swizzle_tensor(sV);
+                    Tensor sV_pi = cute::as_position_independent_swizzle_tensor(sVemu);
                     flash::gemm_pv_cofda_emu<PVEmuFbits, /*ZeroInit=*/Is_first_iter>(
                         tiled_mma_pv, sP_pi, sV_pi(_, _, smem_pipe_read.index()), tOrO, thread_idx);
                 } else if constexpr (!MmaPV_use_RS_WG1) {

@@ -5,7 +5,10 @@
 //
 // P is the FP8 softmax output, staged to smem by the caller (the register
 // fragment is warpgroup-distributed, so a thread cannot read P[m, all k] from
-// registers). V is the FP8 value tile in smem (transposed: sV(n,k) == V[k,n]).
+// registers). V is the FP8 value tile in smem. The emu disables the FP8 STSM
+// transpose (Transpose_V), so V keeps LOGICAL (headdim, seqlen) order in smem
+// (SmemLayoutVt); the position-independent swizzle view gives sV_pi(n,k) == V[k,n]
+// directly, with no seqlen permutation to misalign P[m,k] with V[k,n].
 // The reduction is over kBlockN (this KV block's keys); the CoFDA accumulator is
 // SEEDED with the existing tOrO so the across-block reduction models the
 // hardware's continuous FP32 accumulator.
