@@ -1070,6 +1070,10 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         TORCH_CHECK(params.d == 128,
                     "pv_emu_enabled is only supported for head_dim == 128 (the only "
                     "config validated bit-exact vs hardware; d<=64 is non-deterministic), got d=", params.d);
+        TORCH_CHECK(!paged_KV,
+                    "pv_emu_enabled does not support paged KV: the emu stages V from global "
+                    "memory using the contiguous/varlen (seqlen, headdim) addressing, not the "
+                    "page table. Use a non-paged KV layout for pv emulation.");
     }
     if (qk_emu_enabled || pv_emu_enabled) {
         // Only the no-two-level emulation kernels are instantiated (the validated config),

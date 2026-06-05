@@ -67,11 +67,7 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr bool PackGQA_TMA = PackGQA && kBlockH_ > 1;
     static constexpr bool Split = Split_;
     static constexpr bool V_colmajor = V_colmajor_;
-    // The PV CoFDA emulation replaces the PV WGMMA, so it does not need V transposed.
-    // Disabling Transpose_V keeps V in logical (headdim, seqlen) order in smem so the
-    // emulation can read V[k,n] by logical coordinate (the STSM transpose permutes the
-    // seqlen index, which misaligns P[m,k] with V[k,n] over the reduction).
-    static constexpr bool Transpose_V = Is_FP8 && !V_colmajor && !UsePVEmu;
+    static constexpr bool Transpose_V = Is_FP8 && !V_colmajor;
     static constexpr bool Use_TMA_Q = !PackGQA || PackGQA_TMA;
     static constexpr bool Use_TMA_KV = !PagedKVNonTMA;
     static_assert(Use_TMA_KV || CUTE_STATIC_V(size(ClusterShape{})) == 1, "If not using TMA for KV, ClusterShape must be 1");
@@ -188,6 +184,11 @@ struct CollectiveMainloopFwdSm90 {
     using SmemLayoutAtomP = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
         decltype(cute::get<0>(TileShape_MNK{})), decltype(cute::get<1>(TileShape_MNK{}))>());
     using SmemLayoutP = decltype(tile_to_shape(SmemLayoutAtomP{}, select<0, 1>(TileShape_MNK{})));
+
+    // PV emulation: plain (non-swizzled) logical (kBlockN, kHeadDimV) buffer that the emu
+    // stages V into from GLOBAL memory in true (seqlen, headdim) order, so it reads V[k,n]
+    // by logical coordinate (the FP8 smem V is transposed/swizzled with no logical access).
+    using SmemLayoutVl = cute::Layout<cute::Shape<Int<kBlockN>, Int<kHeadDimV>>>;
 
     // Only for LargeHeadDimV where WG0 sends WG1 the scales
     using SmemLayoutScale = cute::Layout<cute::Shape<Int<kBlockM>, Int<kStages>>>;
@@ -328,6 +329,7 @@ struct CollectiveMainloopFwdSm90 {
     static_assert(SmemAlignmentP >= 128, "Require at least 128B alignment");
 
     using SmemP_t = std::conditional_t<MmaPV_is_RS && !UsePVEmu, cute::array<Element, 0>, cute::array_aligned<Element, cute::cosize_v<SmemLayoutP>, SmemAlignmentP>>;
+    using SmemVl_t = std::conditional_t<!UsePVEmu, cute::array<Element, 0>, cute::array_aligned<Element, cute::cosize_v<SmemLayoutVl>, 128>>;
     using SmemScale_t = std::conditional_t<!LargeHeadDimV, cute::array<float, 0>, cute::array_aligned<float, cute::cosize_v<SmemLayoutScale>, 128>>;
     using SmemQv_t = std::conditional_t<!HasQv, cute::array<Element, 0>, cute::array_aligned<Element, cute::cosize_v<SmemLayoutQv>, SmemAlignmentQv>>;
     // Sometimes even with SmemP_t = cute::array<Element, 0>, putting it in the TensorStorage struct causes
@@ -359,11 +361,8 @@ struct CollectiveMainloopFwdSm90 {
         cute::array_aligned<ElementSAux, cute::cosize_v<SmemLayoutSAux>, 128> smem_s_aux;
     };
 
-    // The PV emulation disables Transpose_V (so it takes this NoTranspose path) but still
-    // needs smem_p to stage P. MmaPV_is_RS is true for the emu, so exclude it here to force
-    // the WithP (smem_p-bearing) variant. SmemP_t is non-empty under UsePVEmu.
     using TensorStorageNoTranspose = std::conditional_t<
-        MmaPV_is_RS && !UsePVEmu,
+        MmaPV_is_RS,
         TensorStorageWithoutPNoTranspose,
         std::conditional_t<!LargeHeadDimV, TensorStorageWithPNoTranspose, TensorStorageWithPScaleNoTranspose>
     >;
@@ -392,6 +391,7 @@ struct CollectiveMainloopFwdSm90 {
         SmemQv_t smem_qv;
         SmemScale_t smem_scale;
         SmemP_t smem_p;
+        SmemVl_t smem_v_emu;
         cute::array_aligned<ElementSAux, cute::cosize_v<SmemLayoutSAux>, 128> smem_s_aux;
     };
 
@@ -1058,17 +1058,19 @@ struct CollectiveMainloopFwdSm90 {
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
         Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});
         Tensor sV = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVtMma{});
-        // PV emulation reads V in logical (headdim, seqlen) order. With Transpose_V disabled
-        // for the emu, smem_v holds V laid out per SmemLayoutVt (the TMA layout, no STSM
-        // transpose), so this is the correct view; SmemLayoutVtMma (used for sV/tOrV above)
-        // would mis-decode the non-transposed bytes. Only used when UsePVEmu.
-        Tensor sVemu = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVt{});
         Tensor sP = [&] {
             if constexpr (MmaPV_is_RS && !UsePVEmu) {
                 // placeholder: smem_q is unused as P storage on the pure-RS path
                 return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutP{});
             } else {
                 return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_p.data()), SmemLayoutP{});
+            }
+        }();
+        Tensor sVl = [&] {
+            if constexpr (UsePVEmu) {
+                return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v_emu.data()), SmemLayoutVl{});
+            } else {  // placeholder, never used
+                return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutVl{});
             }
         }();
         Tensor sScale = [&] {
@@ -1484,15 +1486,42 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (!HasQv) { consumer_wait(pipeline_v, smem_pipe_read); }
                 warp_scheduler_barrier_sync();
                 if constexpr (UsePVEmu) {
+                    // Stage V[this KV block] from GLOBAL memory into the logical buffer sVl(k,n)
+                    // (k=seqlen-within-block, n=headdim). gmem V is logical (seqlen, headdim, head,
+                    // batch) with strides params.stride_V; the FP8 smem V is transposed/swizzled
+                    // and has no usable logical access, so we bypass it for the emu.
+                    bool const is_varlen_k_emu = Varlen && params.cu_seqlens_k;
+                    int const bidb_kv_emu = params.kv_batch_idx == nullptr ? bidb : params.kv_batch_idx[bidb];
+                    int const batch_idx_emu = is_varlen_k_emu ? 0 : bidb_kv_emu;
+                    int const g0 = seqlen_info.offset_k + n_offset + n_block * kBlockN;  // global seqlen of k_local=0
+                    int const valid_k = seqlen_info.seqlen_k - (n_offset + n_block * kBlockN);  // # valid keys in this block
+                    int64_t const v_base = (int64_t)bidh_kv * cute::get<2>(params.stride_V)
+                                         + (int64_t)batch_idx_emu * cute::get<3>(params.stride_V);
+                    // The emu reads the FULL sVl(0..kBlockN, 0..kHeadDimV) on EVERY consumer
+                    // warpgroup (the PV reduction spans all k for every (m,n) output element).
+                    // The release barrier below is per-warpgroup, so each WG must independently
+                    // populate ALL of sVl: stride the write loop by NumThreadsPerWarpGroup using
+                    // the warpgroup-local thread index, not the global thread_idx / NumMmaThreads.
+                    int const wg_lane = thread_idx % cutlass::NumThreadsPerWarpGroup;
+                    #pragma unroll 1
+                    for (int idx = wg_lane; idx < kBlockN * kHeadDimV; idx += cutlass::NumThreadsPerWarpGroup) {
+                        int const k = idx / kHeadDimV;
+                        int const n = idx % kHeadDimV;
+                        Element val = Element(0.f);
+                        if (k < valid_k) {  // masked/padding keys have P==0, so V value is irrelevant; avoid OOB gmem
+                            int64_t const off = (int64_t)(g0 + k) * cute::get<0>(params.stride_V)
+                                              + (int64_t)n * cute::get<1>(params.stride_V) + v_base;
+                            val = params.ptr_V[off];
+                        }
+                        sVl(k, n) = val;
+                    }
+                    cutlass::arch::fence_view_async_shared();
+                    cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup,
+                        static_cast<uint32_t>(FwdNamedBarriers::AppendKV) - 1 + flash::canonical_warp_group_idx_nosync());
                     // Software CoFDA emulation of O=P.V (synchronous; replaces the PV WGMMA).
-                    // tOrO is seeded inside the emu (ZeroInit==Is_first_iter); the rescale above
-                    // already applied for non-first iters. With Transpose_V disabled for the emu,
-                    // sVemu (SmemLayoutVt) holds V in logical (headdim, seqlen) order, so
-                    // sV_pi(n,k) == V[k,n].
                     Tensor sP_pi = cute::as_position_independent_swizzle_tensor(sP);
-                    Tensor sV_pi = cute::as_position_independent_swizzle_tensor(sVemu);
                     flash::gemm_pv_cofda_emu<PVEmuFbits, /*ZeroInit=*/Is_first_iter>(
-                        tiled_mma_pv, sP_pi, sV_pi(_, _, smem_pipe_read.index()), tOrO, thread_idx);
+                        tiled_mma_pv, sP_pi, sVl, tOrO, thread_idx);
                 } else if constexpr (!MmaPV_use_RS_WG1) {
                     flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1, /*SwapAB=*/false, /*M_slice=*/-1, /*DisableFP8TwoLevel=*/DisableFP8TwoLevel>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
                 } else {
