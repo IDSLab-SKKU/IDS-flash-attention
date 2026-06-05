@@ -1393,7 +1393,7 @@ struct CollectiveMainloopFwdSm90 {
             warpgroup_wait<0>();
             pipeline_v.consumer_release(smem_pipe_read);  // release V, otherwise producers will hang
             softmax.rescale_o(tOrO, scores_scale);
-            if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
+            if constexpr (Is_FP8 && !V_colmajor && !UsePVEmu) { flash::permute_output_fp8(tOrO); }  // emu produces logical-ordered O; no MMA->logical permute
             ++smem_pipe_read;
 
         } else {  // No intra-WG overlap
@@ -1589,7 +1589,7 @@ struct CollectiveMainloopFwdSm90 {
                 cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PFull) /*id*/);
             }
             softmax.rescale_o(tOrO, scores_scale);
-            if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
+            if constexpr (Is_FP8 && !V_colmajor && !UsePVEmu) { flash::permute_output_fp8(tOrO); }  // emu produces logical-ordered O; no MMA->logical permute
             ++smem_pipe_read;
         }
         ++work_idx;
@@ -1681,7 +1681,7 @@ struct CollectiveMainloopFwdSm90 {
         load_scales(scores_scale, smem_pipe_read.index());
         cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
         softmax.rescale_o(tOrO, scores_scale);
-        if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
+        if constexpr (Is_FP8 && !V_colmajor && !UsePVEmu) { flash::permute_output_fp8(tOrO); }  // emu produces logical-ordered O; no MMA->logical permute
         ++smem_pipe_read;
         return true;
     }
