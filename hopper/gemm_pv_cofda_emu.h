@@ -10,9 +10,11 @@
 // (k = seqlen-within-block, n = headdim), in true (seqlen, headdim) order. The
 // FP8 smem V is transposed/swizzled for the WGMMA with no logical access, so the
 // emu bypasses it entirely.
-// The reduction is over kBlockN (this KV block's keys); the CoFDA accumulator is
-// SEEDED with the existing tOrO so the across-block reduction models the
-// hardware's continuous FP32 accumulator.
+// The reduction is over kBlockN (this KV block's keys). This computes a SINGLE
+// block's O = P.V from zero (always called with ZeroInit=true); cross-block
+// accumulation is handled by the caller's FP8 two-level merge (backup + clear +
+// FP32 add), so the emu never re-seeds a >F-bit carried accumulator. See
+// docs/superpowers/specs/2026-06-06-pv-cofda-emu-two-level-embed-design.md.
 
 #pragma once
 #include <cute/tensor.hpp>

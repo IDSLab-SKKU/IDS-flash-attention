@@ -1518,10 +1518,29 @@ struct CollectiveMainloopFwdSm90 {
                     cutlass::arch::fence_view_async_shared();
                     cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup,
                         static_cast<uint32_t>(FwdNamedBarriers::AppendKV) - 1 + flash::canonical_warp_group_idx_nosync());
-                    // Software CoFDA emulation of O=P.V (synchronous; replaces the PV WGMMA).
+                    // Software CoFDA emulation of O=P.V (synchronous; replaces the PV WGMMA),
+                    // embedded in the FP8 two-level accumulation structure (mirrors
+                    // flash::gemm, utils.h:243-326): each KV block is accumulated FROM ZERO by
+                    // the emu (the zero-seed case that is bit-exact with a zero-init WGMMA), and
+                    // the carried accumulator is recombined by an FP32 merge OUTSIDE the
+                    // reduced-precision datapath -- reproducing the hardware two-level accumulator.
                     Tensor sP_pi = cute::as_position_independent_swizzle_tensor(sP);
-                    flash::gemm_pv_cofda_emu<PVEmuFbits, /*ZeroInit=*/Is_first_iter>(
-                        tiled_mma_pv, sP_pi, sVl, tOrO, thread_idx);
+                    if constexpr (Is_first_iter) {
+                        // First block: no two-level (reference uses zero_init=true here).
+                        flash::gemm_pv_cofda_emu<PVEmuFbits, /*ZeroInit=*/true>(
+                            tiled_mma_pv, sP_pi, sVl, tOrO, thread_idx);
+                    } else {
+                        // tOrO was already rescaled (softmax.rescale_o, above). Back it up,
+                        // accumulate THIS block's P.V from 0 (the emu overwrites tOrO), then
+                        // element-wise FP32 merge -- identical ops to utils.h:247-248,324.
+                        Tensor tOrO_original = cute::make_fragment_like(tOrO);
+                        #pragma unroll
+                        for (int i = 0; i < cute::size(tOrO); ++i) { tOrO_original(i) = tOrO(i); }
+                        flash::gemm_pv_cofda_emu<PVEmuFbits, /*ZeroInit=*/true>(
+                            tiled_mma_pv, sP_pi, sVl, tOrO, thread_idx);
+                        #pragma unroll
+                        for (int i = 0; i < cute::size(tOrO); ++i) { tOrO(i) = tOrO_original(i) + tOrO(i); }
+                    }
                 } else if constexpr (!MmaPV_use_RS_WG1) {
                     flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1, /*SwapAB=*/false, /*M_slice=*/-1, /*DisableFP8TwoLevel=*/DisableFP8TwoLevel>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
                 } else {
