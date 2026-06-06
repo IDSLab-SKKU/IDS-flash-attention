@@ -1493,10 +1493,22 @@ struct CollectiveMainloopFwdSm90 {
                     bool const is_varlen_k_emu = Varlen && params.cu_seqlens_k;
                     int const bidb_kv_emu = params.kv_batch_idx == nullptr ? bidb : params.kv_batch_idx[bidb];
                     int const batch_idx_emu = is_varlen_k_emu ? 0 : bidb_kv_emu;
-                    int const g0 = seqlen_info.offset_k + n_offset + n_block * kBlockN;  // global seqlen of k_local=0
+                    int const g0 = seqlen_info.offset_k + n_offset + n_block * kBlockN;  // contiguous: global seqlen of k_local=0
                     int const valid_k = seqlen_info.seqlen_k - (n_offset + n_block * kBlockN);  // # valid keys in this block
                     int64_t const v_base = (int64_t)bidh_kv * cute::get<2>(params.stride_V)
                                          + (int64_t)batch_idx_emu * cute::get<3>(params.stride_V);
+                    // Paged-KV support: when a page table is present the V smem cannot be used
+                    // logically, and the contiguous global addressing above is wrong -- each
+                    // logical seqlen position maps to a physical (page, page_offset) via the page
+                    // table. We mirror PagedKVManager exactly (paged_kv.h): the page-space position
+                    // is (n_offset + n_block*kBlockN + k) + leftpad_k, split by page_size into
+                    // (page_idx, page_offset); page = page_table[bidb_kv][page_idx]; and V's 4th
+                    // (batch) dim is the page index, head = bidh_kv. Page table is per-bidb_kv.
+                    bool const paged_emu = params.ptr_pagetable != nullptr;
+                    int const* const pt_base = paged_emu
+                        ? params.ptr_pagetable + (int64_t)bidb_kv_emu * cute::get<0>(params.stride_pagetable)
+                        : nullptr;
+                    int const page_pos0 = n_offset + n_block * kBlockN + seqlen_info.leftpad_k;  // page-space pos of k=0
                     // The emu reads the FULL sVl(0..kBlockN, 0..kHeadDimV) on EVERY consumer
                     // warpgroup (the PV reduction spans all k for every (m,n) output element).
                     // The release barrier below is per-warpgroup, so each WG must independently
@@ -1509,8 +1521,19 @@ struct CollectiveMainloopFwdSm90 {
                         int const n = idx % kHeadDimV;
                         Element val = Element(0.f);
                         if (k < valid_k) {  // masked/padding keys have P==0, so V value is irrelevant; avoid OOB gmem
-                            int64_t const off = (int64_t)(g0 + k) * cute::get<0>(params.stride_V)
-                                              + (int64_t)n * cute::get<1>(params.stride_V) + v_base;
+                            int64_t off;
+                            if (!paged_emu) {
+                                off = (int64_t)(g0 + k) * cute::get<0>(params.stride_V)
+                                    + (int64_t)n * cute::get<1>(params.stride_V) + v_base;
+                            } else {
+                                int page_offset;
+                                int const page_idx = params.page_size_divmod.divmod(page_offset, page_pos0 + k);
+                                int const page = pt_base[(int64_t)page_idx * cute::get<1>(params.stride_pagetable)];
+                                off = (int64_t)page_offset * cute::get<0>(params.stride_V)
+                                    + (int64_t)n * cute::get<1>(params.stride_V)
+                                    + (int64_t)bidh_kv * cute::get<2>(params.stride_V)
+                                    + (int64_t)page * cute::get<3>(params.stride_V);
+                            }
                             val = params.ptr_V[off];
                         }
                         sVl(k, n) = val;

@@ -1070,18 +1070,18 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         TORCH_CHECK(params.d == 128,
                     "pv_emu_enabled is only supported for head_dim == 128 (the only "
                     "config validated bit-exact vs hardware; d<=64 is non-deterministic), got d=", params.d);
-        TORCH_CHECK(!paged_KV,
-                    "pv_emu_enabled does not support paged KV: the emu stages V from global "
-                    "memory using the contiguous/varlen (seqlen, headdim) addressing, not the "
-                    "page table. Use a non-paged KV layout for pv emulation.");
+        // Paged KV is supported: the emu V-staging translates the logical seqlen position
+        // to (page, page_offset) via the page table (mirrors PagedKVManager).
     }
     if (qk_emu_enabled || pv_emu_enabled) {
-        // Only the no-two-level emulation kernels are instantiated (the validated config),
-        // and only one emulation axis at a time. These combos are not built; reject them
-        // here so we never dispatch to a non-existent specialization.
-        TORCH_CHECK(fp8_no_two_level_accum,
-                    "qk_emu_enabled / pv_emu_enabled require fp8_no_two_level_accum=True "
-                    "(only the no-two-level emulation kernels are built)");
+        // QK emu kernels are only instantiated under no-two-level (the validated config),
+        // so QK emu still requires fp8_no_two_level_accum=True. PV emu is instantiated
+        // under BOTH levels (it reproduces two-level PV internally, independent of the
+        // flag), so it does NOT require the flag -- running it with two-level keeps the
+        // QK gemm identical to the hardware reference. Only one axis is built at a time.
+        TORCH_CHECK(!qk_emu_enabled || fp8_no_two_level_accum,
+                    "qk_emu_enabled requires fp8_no_two_level_accum=True "
+                    "(only the no-two-level QK emulation kernels are built)");
         TORCH_CHECK(!(qk_emu_enabled && pv_emu_enabled),
                     "qk_emu_enabled and pv_emu_enabled cannot be set simultaneously yet "
                     "(only single-axis emulation kernels are built); enable one at a time");
