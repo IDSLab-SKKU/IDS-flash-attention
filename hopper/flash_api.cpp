@@ -748,7 +748,9 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         std::optional<const at::Tensor> &cp_tot_seqused_k_, // b. total seqused_k in cp world
         bool fp8_no_two_level_accum,
         bool qk_emu_enabled,
-        int64_t qk_emu_fbits
+        int64_t qk_emu_fbits,
+        bool pv_emu_enabled,
+        int64_t pv_emu_fbits
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -1055,6 +1057,34 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         TORCH_CHECK(params.d == 128,
                     "qk_emu_enabled is only supported for head_dim == 128 (the only "
                     "config validated bit-exact vs hardware; d<=64 is non-deterministic), got d=", params.d);
+    }
+    params.pv_emu_enabled = pv_emu_enabled;
+    params.pv_emu_fbits = static_cast<int>(pv_emu_fbits);
+    if (pv_emu_enabled) {
+        TORCH_CHECK(q_type == at::ScalarType::Float8_e4m3fn,
+                    "pv_emu_enabled requires e4m3 (Float8_e4m3fn) query/key dtype");
+        TORCH_CHECK(dprops->major == 9,
+                    "pv_emu_enabled requires SM90 (Hopper)");
+        TORCH_CHECK(pv_emu_fbits == 13 || pv_emu_fbits == 25,
+                    "pv_emu_fbits must be 13 or 25, got ", pv_emu_fbits);
+        TORCH_CHECK(params.d == 128,
+                    "pv_emu_enabled is only supported for head_dim == 128 (the only "
+                    "config validated bit-exact vs hardware; d<=64 is non-deterministic), got d=", params.d);
+        // Paged KV is supported: the emu V-staging translates the logical seqlen position
+        // to (page, page_offset) via the page table (mirrors PagedKVManager).
+    }
+    if (qk_emu_enabled || pv_emu_enabled) {
+        // QK emu kernels are only instantiated under no-two-level (the validated config),
+        // so QK emu still requires fp8_no_two_level_accum=True. PV emu is instantiated
+        // under BOTH levels (it reproduces two-level PV internally, independent of the
+        // flag), so it does NOT require the flag -- running it with two-level keeps the
+        // QK gemm identical to the hardware reference. Only one axis is built at a time.
+        TORCH_CHECK(!qk_emu_enabled || fp8_no_two_level_accum,
+                    "qk_emu_enabled requires fp8_no_two_level_accum=True "
+                    "(only the no-two-level QK emulation kernels are built)");
+        TORCH_CHECK(!(qk_emu_enabled && pv_emu_enabled),
+                    "qk_emu_enabled and pv_emu_enabled cannot be set simultaneously yet "
+                    "(only single-axis emulation kernels are built); enable one at a time");
     }
 
     bool const use_dynamic_split = use_prepare_varlen && params.b <= PREPARE_VARLEN_MAX_BATCHES_1CTA && params.num_splits > 1;

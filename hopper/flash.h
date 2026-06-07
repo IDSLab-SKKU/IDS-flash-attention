@@ -145,6 +145,8 @@ struct Flash_fwd_params : public Qkv_params {
     bool fp8_no_two_level_accum;  // if true, skip FP8 two-level accumulation in the forward gemm (default false)
     bool qk_emu_enabled;   // if true, replace the QK WGMMA with software CoFDA emulation (default false)
     int  qk_emu_fbits;     // CoFDA fractional accumulator bits, 13 or 25 (only used when qk_emu_enabled)
+    bool pv_emu_enabled;   // if true, replace the PV WGMMA with software CoFDA emulation (default false)
+    int  pv_emu_fbits;     // CoFDA fractional accumulator bits, 13 or 25 (only used when pv_emu_enabled)
     bool is_causal;
     bool is_local;
 

@@ -24,6 +24,7 @@
 #include "utils.h"
 #include "sm90_pipeline_no_cluster.hpp"
 #include "gemm_qk_cofda_emu.h"
+#include "gemm_pv_cofda_emu.h"
 
 namespace flash {
 
@@ -32,7 +33,8 @@ using namespace cute;
 template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
         bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, class ElementSAux_, int kBlockH_=1,
-        bool DisableFP8TwoLevel_=false, bool UseQKEmu_=false, int QKEmuFbits_=25>
+        bool DisableFP8TwoLevel_=false, bool UseQKEmu_=false, int QKEmuFbits_=25,
+        bool UsePVEmu_=false, int PVEmuFbits_=25>
 struct CollectiveMainloopFwdSm90 {
 
     static constexpr int kStages = Stages;
@@ -50,6 +52,10 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr int QKEmuFbits = QKEmuFbits_;
     static_assert(!UseQKEmu || cute::is_same_v<Element, cutlass::float_e4m3_t>,
                   "QK CoFDA emulation requires FP8 e4m3 element type");
+    static constexpr bool UsePVEmu = UsePVEmu_;
+    static constexpr int  PVEmuFbits = PVEmuFbits_;
+    static_assert(!UsePVEmu || cute::is_same_v<Element, cutlass::float_e4m3_t>,
+                  "PV CoFDA emulation is e4m3-only");
     static constexpr bool Is_causal = Is_causal_;
     static constexpr bool Is_local = Is_local_;
     static constexpr bool Has_softcap = Has_softcap_;
@@ -178,6 +184,11 @@ struct CollectiveMainloopFwdSm90 {
     using SmemLayoutAtomP = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
         decltype(cute::get<0>(TileShape_MNK{})), decltype(cute::get<1>(TileShape_MNK{}))>());
     using SmemLayoutP = decltype(tile_to_shape(SmemLayoutAtomP{}, select<0, 1>(TileShape_MNK{})));
+
+    // PV emulation: plain (non-swizzled) logical (kBlockN, kHeadDimV) buffer that the emu
+    // stages V into from GLOBAL memory in true (seqlen, headdim) order, so it reads V[k,n]
+    // by logical coordinate (the FP8 smem V is transposed/swizzled with no logical access).
+    using SmemLayoutVl = cute::Layout<cute::Shape<Int<kBlockN>, Int<kHeadDimV>>>;
 
     // Only for LargeHeadDimV where WG0 sends WG1 the scales
     using SmemLayoutScale = cute::Layout<cute::Shape<Int<kBlockM>, Int<kStages>>>;
@@ -317,7 +328,8 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr size_t SmemAlignmentP = cutlass::detail::alignment_for_swizzle(SmemLayoutP{});
     static_assert(SmemAlignmentP >= 128, "Require at least 128B alignment");
 
-    using SmemP_t = std::conditional_t<MmaPV_is_RS, cute::array<Element, 0>, cute::array_aligned<Element, cute::cosize_v<SmemLayoutP>, SmemAlignmentP>>;
+    using SmemP_t = std::conditional_t<MmaPV_is_RS && !UsePVEmu, cute::array<Element, 0>, cute::array_aligned<Element, cute::cosize_v<SmemLayoutP>, SmemAlignmentP>>;
+    using SmemVl_t = std::conditional_t<!UsePVEmu, cute::array<Element, 0>, cute::array_aligned<Element, cute::cosize_v<SmemLayoutVl>, 128>>;
     using SmemScale_t = std::conditional_t<!LargeHeadDimV, cute::array<float, 0>, cute::array_aligned<float, cute::cosize_v<SmemLayoutScale>, 128>>;
     using SmemQv_t = std::conditional_t<!HasQv, cute::array<Element, 0>, cute::array_aligned<Element, cute::cosize_v<SmemLayoutQv>, SmemAlignmentQv>>;
     // Sometimes even with SmemP_t = cute::array<Element, 0>, putting it in the TensorStorage struct causes
@@ -368,7 +380,23 @@ struct CollectiveMainloopFwdSm90 {
         cute::array_aligned<ElementSAux, cute::cosize_v<SmemLayoutSAux>, 128> smem_s_aux;
     };
 
-    using TensorStorage = std::conditional_t<!Transpose_V, TensorStorageNoTranspose, TensorStorageTransposeV>;
+    // Emu-only variant: identical to TensorStorageTransposeV plus a real smem_p
+    // staging buffer for P. Selected only when UsePVEmu so the proven non-emu
+    // FP8 TransposeV smem layout stays byte-identical.
+    struct TensorStorageTransposeVWithP : cute::aligned_struct<cute::max(SmemAlignmentQ, SmemAlignmentK, SmemAlignmentV, SmemAlignmentP), _0> {
+        cute::array_aligned<Element, cute::cosize_v<SmemLayoutVtMma>, SmemAlignmentV> smem_v;
+        cute::array_aligned<Element, cute::cosize_v<SmemLayoutVt>, SmemAlignmentVt> smem_vt;
+        cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>, SmemAlignmentQ> smem_q;
+        cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>, SmemAlignmentK> smem_k;
+        SmemQv_t smem_qv;
+        SmemScale_t smem_scale;
+        SmemP_t smem_p;
+        SmemVl_t smem_v_emu;
+        cute::array_aligned<ElementSAux, cute::cosize_v<SmemLayoutSAux>, 128> smem_s_aux;
+    };
+
+    using TensorStorage = std::conditional_t<!Transpose_V, TensorStorageNoTranspose,
+        std::conditional_t<UsePVEmu, TensorStorageTransposeVWithP, TensorStorageTransposeV>>;
 
     // These are tuned for speed. They don't affect correctness.
     static constexpr bool UseSchedulerBarrier = (IntraWGOverlap
@@ -1031,11 +1059,18 @@ struct CollectiveMainloopFwdSm90 {
         Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});
         Tensor sV = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVtMma{});
         Tensor sP = [&] {
-            if constexpr (MmaPV_is_RS) {
-                // We might not have smem_p if !MmaPV_is_RS, just use smem_q as a placeholder since we don't use it
+            if constexpr (MmaPV_is_RS && !UsePVEmu) {
+                // placeholder: smem_q is unused as P storage on the pure-RS path
                 return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutP{});
             } else {
                 return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_p.data()), SmemLayoutP{});
+            }
+        }();
+        Tensor sVl = [&] {
+            if constexpr (UsePVEmu) {
+                return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v_emu.data()), SmemLayoutVl{});
+            } else {  // placeholder, never used
+                return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutVl{});
             }
         }();
         Tensor sScale = [&] {
@@ -1358,7 +1393,7 @@ struct CollectiveMainloopFwdSm90 {
             warpgroup_wait<0>();
             pipeline_v.consumer_release(smem_pipe_read);  // release V, otherwise producers will hang
             softmax.rescale_o(tOrO, scores_scale);
-            if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
+            if constexpr (Is_FP8 && !V_colmajor && !UsePVEmu) { flash::permute_output_fp8(tOrO); }  // emu produces logical-ordered O; no MMA->logical permute
             ++smem_pipe_read;
 
         } else {  // No intra-WG overlap
@@ -1414,6 +1449,32 @@ struct CollectiveMainloopFwdSm90 {
                 Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
                 if constexpr (LargeHeadDimV && !Is_first_iter) { store_scales(scores_scale, smem_pipe_read_prev.index()); }
                 softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
+                if constexpr (UsePVEmu) {
+                    // Stage P (softmax probs) to smem for the CoFDA emulation BEFORE the FP8
+                    // permute, while tSrS is still in the clean QK accumulator (m,n) layout.
+                    // P is register-source here (MmaPV_is_RS), but the emu needs arbitrary
+                    // P[m,k] from any thread, so we stage to smem. Convert fp32->e4m3 with the
+                    // SAME converter as the hardware path (convert_type_out) and scalar-write by
+                    // (m,k) coordinate -- the STSM-based write_P_to_smem does not vectorize for
+                    // the FP8 register-source P layout.
+                    Tensor tPrP = make_tensor_like<Element>(tSrS);
+                    convert_type_out(tSrS, tPrP);
+                    Tensor sP_pi_w = cute::as_position_independent_swizzle_tensor(sP);
+                    Tensor cP = cute::make_identity_tensor(select<0, 1>(TileShape_MNK{}));
+                    Tensor tPcP = tiled_mma_qk.get_thread_slice(thread_idx).partition_C(cP);
+                    CUTE_STATIC_ASSERT_V(size(tPcP) == size(tPrP));
+                    #pragma unroll
+                    for (int i = 0; i < size(tPrP); ++i) {
+                        sP_pi_w(get<0>(tPcP(i)), get<1>(tPcP(i))) = tPrP(i);
+                    }
+                    // Full-warpgroup ordering: the emu reads sP(m,k) written by OTHER threads in
+                    // this warpgroup (the P-fragment owner differs from the O-fragment owner), so
+                    // __syncwarp is insufficient -- use a per-WG NamedBarrier (AppendKV id, idle
+                    // in the main KV loop; distinct per WG so the ping-pong can't mis-pair it).
+                    cutlass::arch::fence_view_async_shared();
+                    cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup,
+                        static_cast<uint32_t>(FwdNamedBarriers::AppendKV) - 1 + flash::canonical_warp_group_idx_nosync());
+                }
                 if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
                 Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMmaPV>(tSrS.layout()));
                 Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
@@ -1424,14 +1485,102 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (!MmaPV_is_RS && !MmaPV_use_RS_WG1) { arrive_on_P_write_barrier(); }
                 if constexpr (!HasQv) { consumer_wait(pipeline_v, smem_pipe_read); }
                 warp_scheduler_barrier_sync();
-                if constexpr (!MmaPV_use_RS_WG1) {
+                if constexpr (UsePVEmu) {
+                    // Stage V[this KV block] from GLOBAL memory into the logical buffer sVl(k,n)
+                    // (k=seqlen-within-block, n=headdim). gmem V is logical (seqlen, headdim, head,
+                    // batch) with strides params.stride_V; the FP8 smem V is transposed/swizzled
+                    // and has no usable logical access, so we bypass it for the emu.
+                    bool const is_varlen_k_emu = Varlen && params.cu_seqlens_k;
+                    int const bidb_kv_emu = params.kv_batch_idx == nullptr ? bidb : params.kv_batch_idx[bidb];
+                    int const batch_idx_emu = is_varlen_k_emu ? 0 : bidb_kv_emu;
+                    int const g0 = seqlen_info.offset_k + n_offset + n_block * kBlockN;  // contiguous: global seqlen of k_local=0
+                    int const valid_k = seqlen_info.seqlen_k - (n_offset + n_block * kBlockN);  // # valid keys in this block
+                    int64_t const v_base = (int64_t)bidh_kv * cute::get<2>(params.stride_V)
+                                         + (int64_t)batch_idx_emu * cute::get<3>(params.stride_V);
+                    // Paged-KV support: when a page table is present the V smem cannot be used
+                    // logically, and the contiguous global addressing above is wrong -- each
+                    // logical seqlen position maps to a physical (page, page_offset) via the page
+                    // table. We mirror PagedKVManager exactly (paged_kv.h): the page-space position
+                    // is (n_offset + n_block*kBlockN + k) + leftpad_k, split by page_size into
+                    // (page_idx, page_offset); page = page_table[bidb_kv][page_idx]; and V's 4th
+                    // (batch) dim is the page index, head = bidh_kv. Page table is per-bidb_kv.
+                    bool const paged_emu = params.ptr_pagetable != nullptr;
+                    int const* const pt_base = paged_emu
+                        ? params.ptr_pagetable + (int64_t)bidb_kv_emu * cute::get<0>(params.stride_pagetable)
+                        : nullptr;
+                    int const page_pos0 = n_offset + n_block * kBlockN + seqlen_info.leftpad_k;  // page-space pos of k=0
+                    // The emu reads the FULL sVl(0..kBlockN, 0..kHeadDimV) on EVERY consumer
+                    // warpgroup (the PV reduction spans all k for every (m,n) output element).
+                    // The release barrier below is per-warpgroup, so each WG must independently
+                    // populate ALL of sVl: stride the write loop by NumThreadsPerWarpGroup using
+                    // the warpgroup-local thread index, not the global thread_idx / NumMmaThreads.
+                    int const wg_lane = thread_idx % cutlass::NumThreadsPerWarpGroup;
+                    #pragma unroll 1
+                    for (int idx = wg_lane; idx < kBlockN * kHeadDimV; idx += cutlass::NumThreadsPerWarpGroup) {
+                        int const k = idx / kHeadDimV;
+                        int const n = idx % kHeadDimV;
+                        Element val = Element(0.f);
+                        if (k < valid_k) {  // masked/padding keys have P==0, so V value is irrelevant; avoid OOB gmem
+                            int64_t off;
+                            if (!paged_emu) {
+                                off = (int64_t)(g0 + k) * cute::get<0>(params.stride_V)
+                                    + (int64_t)n * cute::get<1>(params.stride_V) + v_base;
+                            } else {
+                                int page_offset;
+                                int const page_idx = params.page_size_divmod.divmod(page_offset, page_pos0 + k);
+                                int const page = pt_base[(int64_t)page_idx * cute::get<1>(params.stride_pagetable)];
+                                off = (int64_t)page_offset * cute::get<0>(params.stride_V)
+                                    + (int64_t)n * cute::get<1>(params.stride_V)
+                                    + (int64_t)bidh_kv * cute::get<2>(params.stride_V)
+                                    + (int64_t)page * cute::get<3>(params.stride_V);
+                            }
+                            val = params.ptr_V[off];
+                        }
+                        sVl(k, n) = val;
+                    }
+                    cutlass::arch::fence_view_async_shared();
+                    cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup,
+                        static_cast<uint32_t>(FwdNamedBarriers::AppendKV) - 1 + flash::canonical_warp_group_idx_nosync());
+                    // Software CoFDA emulation of O=P.V (synchronous; replaces the PV WGMMA),
+                    // embedded in the FP8 two-level accumulation structure (mirrors
+                    // flash::gemm, utils.h:243-326): each KV block is accumulated FROM ZERO by
+                    // the emu (the zero-seed case that is bit-exact with a zero-init WGMMA), and
+                    // the carried accumulator is recombined by an FP32 merge OUTSIDE the
+                    // reduced-precision datapath -- reproducing the hardware two-level accumulator.
+                    Tensor sP_pi = cute::as_position_independent_swizzle_tensor(sP);
+                    if constexpr (Is_first_iter) {
+                        // First block: no two-level (reference uses zero_init=true here).
+                        flash::gemm_pv_cofda_emu<PVEmuFbits, /*ZeroInit=*/true>(
+                            tiled_mma_pv, sP_pi, sVl, tOrO, thread_idx);
+                    } else {
+                        // tOrO was already rescaled (softmax.rescale_o, above). Back it up,
+                        // accumulate THIS block's P.V from 0 (the emu overwrites tOrO), then
+                        // element-wise FP32 merge -- identical ops to utils.h:247-248,324.
+                        Tensor tOrO_original = cute::make_fragment_like(tOrO);
+                        #pragma unroll
+                        for (int i = 0; i < cute::size(tOrO); ++i) { tOrO_original(i) = tOrO(i); }
+                        flash::gemm_pv_cofda_emu<PVEmuFbits, /*ZeroInit=*/true>(
+                            tiled_mma_pv, sP_pi, sVl, tOrO, thread_idx);
+                        #pragma unroll
+                        for (int i = 0; i < cute::size(tOrO); ++i) { tOrO(i) = tOrO_original(i) + tOrO(i); }
+                    }
+                } else if constexpr (!MmaPV_use_RS_WG1) {
                     flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1, /*SwapAB=*/false, /*M_slice=*/-1, /*DisableFP8TwoLevel=*/DisableFP8TwoLevel>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
                 } else {
                     TiledMmaPV_RS tiled_mma_pv_rs;
                     flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1, /*SwapAB=*/false, /*M_slice=*/-1, /*DisableFP8TwoLevel=*/DisableFP8TwoLevel>(tiled_mma_pv_rs, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
                 }
                 if constexpr (!MmaPV_is_RS && MmaPV_use_RS_WG1) { arrive_on_P_write_barrier(); }
-                warpgroup_wait<0>();
+                if constexpr (!UsePVEmu) {
+                    warpgroup_wait<0>();
+                } else {
+                    // The emu reads V via synchronous LDS; consumer_release is COLLECTIVE,
+                    // so a straggler thread can still be mid-read when the V producer reuses
+                    // the stage (the QK long-context race, applied to V). Per-WG NamedBarrier
+                    // so every thread finished reading V before this WG releases the stage.
+                    cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup,
+                        static_cast<uint32_t>(FwdNamedBarriers::AppendKV) - 1 + flash::canonical_warp_group_idx_nosync());
+                }
                 pipeline_v.consumer_release(smem_pipe_read);  // release V
             };
 
@@ -1482,7 +1631,7 @@ struct CollectiveMainloopFwdSm90 {
                 cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PFull) /*id*/);
             }
             softmax.rescale_o(tOrO, scores_scale);
-            if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
+            if constexpr (Is_FP8 && !V_colmajor && !UsePVEmu) { flash::permute_output_fp8(tOrO); }  // emu produces logical-ordered O; no MMA->logical permute
             ++smem_pipe_read;
         }
         ++work_idx;
@@ -1574,7 +1723,7 @@ struct CollectiveMainloopFwdSm90 {
         load_scales(scores_scale, smem_pipe_read.index());
         cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
         softmax.rescale_o(tOrO, scores_scale);
-        if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
+        if constexpr (Is_FP8 && !V_colmajor && !UsePVEmu) { flash::permute_output_fp8(tOrO); }  // emu produces logical-ordered O; no MMA->logical permute
         ++smem_pipe_read;
         return true;
     }
