@@ -1541,21 +1541,26 @@ struct CollectiveMainloopFwdSm90 {
                     cutlass::arch::fence_view_async_shared();
                     cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup,
                         static_cast<uint32_t>(FwdNamedBarriers::AppendKV) - 1 + flash::canonical_warp_group_idx_nosync());
-                    // Software CoFDA emulation of O=P.V (synchronous; replaces the PV WGMMA),
-                    // embedded in the FP8 two-level accumulation structure (mirrors
-                    // flash::gemm, utils.h:243-326): each KV block is accumulated FROM ZERO by
-                    // the emu (the zero-seed case that is bit-exact with a zero-init WGMMA), and
-                    // the carried accumulator is recombined by an FP32 merge OUTSIDE the
-                    // reduced-precision datapath -- reproducing the hardware two-level accumulator.
+                    // Software CoFDA emulation of O=P.V (synchronous; replaces the PV WGMMA).
+                    // Two accumulation modes mirror the hardware, gated by DisableFP8TwoLevel:
                     Tensor sP_pi = cute::as_position_independent_swizzle_tensor(sP);
-                    if constexpr (Is_first_iter) {
-                        // First block: no two-level (reference uses zero_init=true here).
+                    if constexpr (DisableFP8TwoLevel) {
+                        // NO-two-level: accumulate THIS block's P.V continuously onto the carried
+                        // accumulator (seed from the already-rescaled tOrO; ZeroInit only on the
+                        // first block), with NO FP32 merge -- the carry is re-quantized to F frac
+                        // bits each block inside the reduced-precision datapath, reproducing the
+                        // hardware no-two-level (ScaleOut::One) continuous accumulator.
+                        flash::gemm_pv_cofda_emu<PVEmuFbits, /*ZeroInit=*/Is_first_iter>(
+                            tiled_mma_pv, sP_pi, sVl, tOrO, thread_idx);
+                    } else if constexpr (Is_first_iter) {
+                        // TWO-level (mirrors flash::gemm, utils.h:243-326). First block: from zero.
                         flash::gemm_pv_cofda_emu<PVEmuFbits, /*ZeroInit=*/true>(
                             tiled_mma_pv, sP_pi, sVl, tOrO, thread_idx);
                     } else {
-                        // tOrO was already rescaled (softmax.rescale_o, above). Back it up,
-                        // accumulate THIS block's P.V from 0 (the emu overwrites tOrO), then
-                        // element-wise FP32 merge -- identical ops to utils.h:247-248,324.
+                        // TWO-level: tOrO was already rescaled (softmax.rescale_o, above). Back it
+                        // up, accumulate THIS block's P.V from 0 (the emu overwrites tOrO), then
+                        // element-wise FP32 merge OUTSIDE the reduced-precision datapath -- identical
+                        // ops to utils.h:247-248,324, reproducing the hardware two-level accumulator.
                         Tensor tOrO_original = cute::make_fragment_like(tOrO);
                         #pragma unroll
                         for (int i = 0; i < cute::size(tOrO); ++i) { tOrO_original(i) = tOrO(i); }
