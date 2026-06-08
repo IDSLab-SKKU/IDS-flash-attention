@@ -1074,14 +1074,13 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         // to (page, page_offset) via the page table (mirrors PagedKVManager).
     }
     if (qk_emu_enabled || pv_emu_enabled) {
-        // QK emu kernels are only instantiated under no-two-level (the validated config),
-        // so QK emu still requires fp8_no_two_level_accum=True. PV emu is instantiated
-        // under BOTH levels (it reproduces two-level PV internally, independent of the
-        // flag), so it does NOT require the flag -- running it with two-level keeps the
-        // QK gemm identical to the hardware reference. Only one axis is built at a time.
-        TORCH_CHECK(!qk_emu_enabled || fp8_no_two_level_accum,
-                    "qk_emu_enabled requires fp8_no_two_level_accum=True "
-                    "(only the no-two-level QK emulation kernels are built)");
+        // Both emu axes are instantiated under BOTH two-level and no-two-level.
+        // The two-level flag only governs the PV gemm: the QK CoFDA emu
+        // (gemm_qk_cofda_emu) is computed with zero_init=true, so Use_Two_Level is
+        // always false for the QK gemm and the emulated QK result is identical
+        // regardless of the flag. Running QK emu with two-level therefore keeps the
+        // PV path on the hardware two-level reference. Only one axis is built at a
+        // time, so QK and PV emu still cannot be combined.
         TORCH_CHECK(!(qk_emu_enabled && pv_emu_enabled),
                     "qk_emu_enabled and pv_emu_enabled cannot be set simultaneously yet "
                     "(only single-axis emulation kernels are built); enable one at a time");
