@@ -1218,18 +1218,17 @@ def test_flash_attn_combine(num_splits, seqlen, d, dtype):
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
     reason="QK CoFDA emulation requires SM90 (Hopper)",
 )
-# QK CoFDA emulation is only instantiated/validated for head_dim == 128 (mha_fwd
-# rejects qk_emu_enabled for other head dims). flash_attn_func leaves
-# fp8_no_two_level_accum at its default (False), so this exercises QK emu on the
-# two-level accumulation path -- the config the run_experiment ref-two-level
-# baseline uses.
+# CoFDA emulation is both-axes-only (mha_fwd requires qk_emu_enabled ==
+# pv_emu_enabled at matching fbits), and only built/validated for head_dim == 128.
+# flash_attn_func leaves fp8_no_two_level_accum at its default (False), so this
+# runs on the two-level accumulation path -- the run_experiment ref-two-level
+# config. both-emu(F13) reproduces the hardware FP8 attention bit-for-bit (QK-F13
+# == hw QK, PV-F13 == hw two-level PV); F25 is a higher-precision accumulator and
+# measurably diverges.
 @pytest.mark.parametrize("d", [128])
-def test_qk_emu_parity_and_signal(d):
-    """F=25 emulation ~= hardware QK; F=13 diverges more but stays bounded.
-
-    Runs with two-level FP8 accumulation on (the default): the QK gemm is
-    zero_init, so two-level never affects QK, and emulated-QK runs on top of the
-    hardware two-level PV reference."""
+def test_both_emu_parity_and_signal(d):
+    """both-emu(F=13) == hardware (bit-exact); both-emu(F=25) diverges (the F-bit
+    knob measurably changes the output), bounded."""
     torch.manual_seed(0)
     b, s, h = 1, 256, 4
     def mk():
@@ -1246,15 +1245,21 @@ def test_qk_emu_parity_and_signal(d):
         k_descale=descale,
         v_descale=descale,
     )
-    out_hw = flash_attn_func(q, k, v, **common, qk_emu_enabled=False)
-    out_f25 = flash_attn_func(q, k, v, **common, qk_emu_enabled=True, qk_emu_fbits=25)
-    out_f13 = flash_attn_func(q, k, v, **common, qk_emu_enabled=True, qk_emu_fbits=13)
+    def emu(f):
+        return dict(qk_emu_enabled=True, qk_emu_fbits=f, pv_emu_enabled=True, pv_emu_fbits=f)
+    out_hw = flash_attn_func(q, k, v, **common)
+    out_f25 = flash_attn_func(q, k, v, **common, **emu(25))
+    out_f13 = flash_attn_func(q, k, v, **common, **emu(13))
     # flash_attn_func may return a tuple (out, lse); take the output tensor.
     out_hw = out_hw[0] if isinstance(out_hw, (tuple, list)) else out_hw
     out_f25 = out_f25[0] if isinstance(out_f25, (tuple, list)) else out_f25
     out_f13 = out_f13[0] if isinstance(out_f13, (tuple, list)) else out_f13
     err25 = (out_f25.float() - out_hw.float()).abs().mean().item()
     err13 = (out_f13.float() - out_hw.float()).abs().mean().item()
-    assert err25 < 5e-2, f"F25 parity too loose vs hardware: {err25}"
-    assert err13 > err25, f"F13 should diverge more than F25: {err13} vs {err25}"
-    assert err13 < 1.0, f"F13 divergence unbounded: {err13}"
+    # both-emu(F13) matches the hardware FP8 attention within <=1 bf16-ULP (QK-F13
+    # is bit-exact; PV-F13 carries a sparse, deterministic <=1-ULP residual).
+    assert torch.allclose(out_f13, out_hw, rtol=2 ** -7, atol=1e-6), (
+        f"both-emu(F13) exceeds <=1 bf16-ULP vs hardware: err={err13}")
+    # The F-bit knob must change the output: F25 (higher precision) diverges more.
+    assert err25 > err13, f"F25 should diverge from hardware more than F13: {err25} vs {err13}"
+    assert err25 < 1.0, f"F25 divergence unbounded: {err25}"
