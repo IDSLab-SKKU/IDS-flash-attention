@@ -1218,9 +1218,18 @@ def test_flash_attn_combine(num_splits, seqlen, d, dtype):
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
     reason="QK CoFDA emulation requires SM90 (Hopper)",
 )
-@pytest.mark.parametrize("d", [64, 128])
+# QK CoFDA emulation is only instantiated/validated for head_dim == 128 (mha_fwd
+# rejects qk_emu_enabled for other head dims). flash_attn_func leaves
+# fp8_no_two_level_accum at its default (False), so this exercises QK emu on the
+# two-level accumulation path -- the config the run_experiment ref-two-level
+# baseline uses.
+@pytest.mark.parametrize("d", [128])
 def test_qk_emu_parity_and_signal(d):
-    """F=25 emulation ~= hardware QK; F=13 diverges more but stays bounded."""
+    """F=25 emulation ~= hardware QK; F=13 diverges more but stays bounded.
+
+    Runs with two-level FP8 accumulation on (the default): the QK gemm is
+    zero_init, so two-level never affects QK, and emulated-QK runs on top of the
+    hardware two-level PV reference."""
     torch.manual_seed(0)
     b, s, h = 1, 256, 4
     def mk():
