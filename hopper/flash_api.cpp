@@ -1073,18 +1073,13 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         // Paged KV is supported: the emu V-staging translates the logical seqlen position
         // to (page, page_offset) via the page table (mirrors PagedKVManager).
     }
-    if (qk_emu_enabled || pv_emu_enabled) {
-        // Both emu axes are instantiated under BOTH two-level and no-two-level.
-        // The two-level flag only governs the PV gemm: the QK CoFDA emu
-        // (gemm_qk_cofda_emu) is computed with zero_init=true, so Use_Two_Level is
-        // always false for the QK gemm and the emulated QK result is identical
-        // regardless of the flag. Running QK emu with two-level therefore keeps the
-        // PV path on the hardware two-level reference. Only one axis is built at a
-        // time, so QK and PV emu still cannot be combined.
-        TORCH_CHECK(!(qk_emu_enabled && pv_emu_enabled),
-                    "qk_emu_enabled and pv_emu_enabled cannot be set simultaneously yet "
-                    "(only single-axis emulation kernels are built); enable one at a time");
-    }
+    // QK and PV CoFDA emulation are independent axes (they replace different
+    // gemms) and are instantiated for every combination -- QK-only, PV-only, and
+    // both together -- under both two-level and no-two-level, for kHeadDim==128.
+    // The two-level flag only governs the PV gemm: the QK emu (gemm_qk_cofda_emu)
+    // is computed with zero_init=true, so Use_Two_Level is always false for QK and
+    // the emulated QK result is identical regardless of the flag. Enabling both
+    // axes therefore yields emulated-QK + emulated-PV.
 
     bool const use_dynamic_split = use_prepare_varlen && params.b <= PREPARE_VARLEN_MAX_BATCHES_1CTA && params.num_splits > 1;
     // disable split for varlen and >992 batches for now
