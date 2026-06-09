@@ -4,7 +4,6 @@
 *.cubin
 *.plk
 .DS_store
-.vscode
 worktrees/
 
 # Byte-compiled / optimized / DLL files
@@ -32,7 +31,6 @@ var/
 
 # IDE-related
 .idea/
-.vscode/
 
 # Dev
 venv
@@ -41,3 +39,7 @@ benchmarks/results/
 
 # compile-time generated file
 flash_attn_config.py
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+.gitignore

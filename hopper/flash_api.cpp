@@ -1073,17 +1073,25 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         // Paged KV is supported: the emu V-staging translates the logical seqlen position
         // to (page, page_offset) via the page table (mirrors PagedKVManager).
     }
+    // CoFDA emulation is exposed as BOTH-AXES ONLY at matching F-bits: QK and PV
+    // must be emulated together (mixing a hardware and an emulated gemm confounds
+    // the comparison). This guard enforces that at runtime.
+    //
+    // NOTE: the single-axis kernels are still INSTANTIATED (see
+    // flash_fwd_launch_template.h) even though this guard makes them unreachable.
+    // Removing them shrinks the build but exposes a build-sensitive codegen
+    // regression in the both-emu kernel: with only the both-emu instantiations in
+    // the TU, both-emu silently drifts ~0.2% on the real model (WikiText-2 limit 1:
+    // 6.3369 -> 6.3238) while staying synthetically bit-exact. Not a race
+    // (compute-sanitizer racecheck clean) and not ccache. Keep single-axis
+    // instantiated until that codegen sensitivity is root-caused/fixed.
     if (qk_emu_enabled || pv_emu_enabled) {
-        // Both emu axes are instantiated under BOTH two-level and no-two-level.
-        // The two-level flag only governs the PV gemm: the QK CoFDA emu
-        // (gemm_qk_cofda_emu) is computed with zero_init=true, so Use_Two_Level is
-        // always false for the QK gemm and the emulated QK result is identical
-        // regardless of the flag. Running QK emu with two-level therefore keeps the
-        // PV path on the hardware two-level reference. Only one axis is built at a
-        // time, so QK and PV emu still cannot be combined.
-        TORCH_CHECK(!(qk_emu_enabled && pv_emu_enabled),
-                    "qk_emu_enabled and pv_emu_enabled cannot be set simultaneously yet "
-                    "(only single-axis emulation kernels are built); enable one at a time");
+        TORCH_CHECK(qk_emu_enabled && pv_emu_enabled,
+                    "CoFDA emulation requires BOTH qk_emu_enabled and pv_emu_enabled "
+                    "(single-axis ref+emu is disabled); enable both together");
+        TORCH_CHECK(qk_emu_fbits == pv_emu_fbits,
+                    "both-emu requires matching qk_emu_fbits == pv_emu_fbits, got qk=",
+                    qk_emu_fbits, ", pv=", pv_emu_fbits);
     }
 
     bool const use_dynamic_split = use_prepare_varlen && params.b <= PREPARE_VARLEN_MAX_BATCHES_1CTA && params.num_splits > 1;
