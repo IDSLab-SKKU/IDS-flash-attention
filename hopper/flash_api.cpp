@@ -1054,9 +1054,9 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
                     "qk_emu_enabled requires SM90 (Hopper)");
         TORCH_CHECK(qk_emu_fbits == 13 || qk_emu_fbits == 25,
                     "qk_emu_fbits must be 13 or 25, got ", qk_emu_fbits);
-        TORCH_CHECK(params.d == 128,
-                    "qk_emu_enabled is only supported for head_dim == 128 (the only "
-                    "config validated bit-exact vs hardware; d<=64 is non-deterministic), got d=", params.d);
+        TORCH_CHECK(params.d == 128 || params.d == 256,
+                    "qk_emu_enabled is only supported for head_dim == 128 or 256 "
+                    "(d<=64 is non-deterministic), got d=", params.d);
     }
     params.pv_emu_enabled = pv_emu_enabled;
     params.pv_emu_fbits = static_cast<int>(pv_emu_fbits);
@@ -1067,9 +1067,9 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
                     "pv_emu_enabled requires SM90 (Hopper)");
         TORCH_CHECK(pv_emu_fbits == 13 || pv_emu_fbits == 25,
                     "pv_emu_fbits must be 13 or 25, got ", pv_emu_fbits);
-        TORCH_CHECK(params.d == 128,
-                    "pv_emu_enabled is only supported for head_dim == 128 (the only "
-                    "config validated bit-exact vs hardware; d<=64 is non-deterministic), got d=", params.d);
+        TORCH_CHECK(params.d == 128 || params.d == 256,
+                    "pv_emu_enabled is only supported for head_dim == 128 or 256 "
+                    "(d<=64 is non-deterministic), got d=", params.d);
         // Paged KV is supported: the emu V-staging translates the logical seqlen position
         // to (page, page_offset) via the page table (mirrors PagedKVManager).
     }
