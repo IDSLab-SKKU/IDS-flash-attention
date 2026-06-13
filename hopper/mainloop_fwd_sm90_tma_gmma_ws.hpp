@@ -402,7 +402,7 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr bool UseSchedulerBarrier = (IntraWGOverlap
         ? (NumMmaWarpGroups >= 2) && (!Is_FP8 ? kHeadDim <= 128 : kHeadDim >= 128)
         : NumMmaWarpGroups == 2)
-        && !LargeHeadDimV;
+        && !LargeHeadDimV && !(UsePVEmu && Split);
     static constexpr bool RescaleOBeforeGemm = kHeadDim > 128 && (!Is_FP8 || V_colmajor) && IntraWGOverlap;
 
     // Host side kernel arguments

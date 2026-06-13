@@ -124,7 +124,7 @@ struct Softmax {
     };
 
     template<bool Is_first, bool Check_inf=false, typename Tensor0>
-    __forceinline__ __device__ void online_softmax(Tensor0 &acc_s) {
+    __noinline__ __device__ void online_softmax(Tensor0 &acc_s) {
         // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
         static_assert(CUTE_STATIC_V(size<0>(scores)) == kNRows);
