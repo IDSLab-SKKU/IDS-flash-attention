@@ -329,6 +329,10 @@ struct CollectiveMainloopFwdSm90 {
     static_assert(SmemAlignmentP >= 128, "Require at least 128B alignment");
 
     using SmemP_t = std::conditional_t<MmaPV_is_RS && !UsePVEmu, cute::array<Element, 0>, cute::array_aligned<Element, cute::cosize_v<SmemLayoutP>, SmemAlignmentP>>;
+    // PV emulation reads logical V from global memory into SmemVl_t and never
+    // consumes the hardware PV V-smem pipeline. Drop that hardware V storage
+    // only on the emu/no-Qv path to stay under SM90's opt-in smem limit.
+    static constexpr bool BypassPVEmuHardwareV = UsePVEmu && !HasQv && Transpose_V;
     using SmemVl_t = std::conditional_t<!UsePVEmu, cute::array<Element, 0>, cute::array_aligned<Element, cute::cosize_v<SmemLayoutVl>, 128>>;
     using SmemScale_t = std::conditional_t<!LargeHeadDimV, cute::array<float, 0>, cute::array_aligned<float, cute::cosize_v<SmemLayoutScale>, 128>>;
     using SmemQv_t = std::conditional_t<!HasQv, cute::array<Element, 0>, cute::array_aligned<Element, cute::cosize_v<SmemLayoutQv>, SmemAlignmentQv>>;
@@ -395,8 +399,19 @@ struct CollectiveMainloopFwdSm90 {
         cute::array_aligned<ElementSAux, cute::cosize_v<SmemLayoutSAux>, 128> smem_s_aux;
     };
 
+    struct TensorStoragePVEmuNoHWV : cute::aligned_struct<cute::max(SmemAlignmentQ, SmemAlignmentK, SmemAlignmentP), _0> {
+        SmemVl_t smem_v;
+        cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>, SmemAlignmentQ> smem_q;
+        cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>, SmemAlignmentK> smem_k;
+        SmemQv_t smem_qv;
+        SmemScale_t smem_scale;
+        SmemP_t smem_p;
+        cute::array_aligned<ElementSAux, cute::cosize_v<SmemLayoutSAux>, 128> smem_s_aux;
+    };
+
     using TensorStorage = std::conditional_t<!Transpose_V, TensorStorageNoTranspose,
-        std::conditional_t<UsePVEmu, TensorStorageTransposeVWithP, TensorStorageTransposeV>>;
+        std::conditional_t<BypassPVEmuHardwareV, TensorStoragePVEmuNoHWV,
+        std::conditional_t<UsePVEmu, TensorStorageTransposeVWithP, TensorStorageTransposeV>>>;
 
     // These are tuned for speed. They don't affect correctness.
     static constexpr bool UseSchedulerBarrier = (IntraWGOverlap
@@ -689,17 +704,27 @@ struct CollectiveMainloopFwdSm90 {
         // as_position_independent_swizzle_tensor makes address calculation easier when we do LDSM & STSM to transpose.
         // But it requires smem_vt and smem_v to be aligned to e.g 512 bytes.
         Tensor sVt = [&] {
-            if constexpr (!Transpose_V) {
+            if constexpr (BypassPVEmuHardwareV) {
+                return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutVt{});
+            } else if constexpr (!Transpose_V) {
                 return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVt{});
             } else {
                 return cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_vt.data()), SmemLayoutVt{}));
             }
         }();
-        // Only used if Transpose_V
-        Tensor sV = cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVtMma{}));
-        // Only used if we're using cp.async to load V
+        // Only used if Transpose_V and the hardware V path is active.
+        Tensor sV = [&] {
+            if constexpr (BypassPVEmuHardwareV) {
+                return cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutVtMma{}));
+            } else {
+                return cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVtMma{}));
+            }
+        }();
+        // Only used if we're using cp.async to load V and the hardware V path is active.
         Tensor sVcpasync = [&] {
-            if constexpr (!Transpose_V) {
+            if constexpr (BypassPVEmuHardwareV) {
+                return cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutVCpAsync{}));
+            } else if constexpr (!Transpose_V) {
                 return cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVCpAsync{}));
             } else {
                 return cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_vt.data()), SmemLayoutVCpAsync{}));
@@ -876,7 +901,7 @@ struct CollectiveMainloopFwdSm90 {
             } else {
                 paged_kv_manager.template load_page_table_TMA<true /*First_iter*/>(n_block);
             }
-            if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
+            if constexpr (Transpose_V && !BypassPVEmuHardwareV) { load_V(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
             // if (thread_idx == 0) { printf("Producer: main load, before load_K, index = %d\n", smem_pipe_write.index());}
             load_K(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/);
             // if (thread_idx == 0) { printf("Producer: main load, after load K, index = %d\n", smem_pipe_write.index());}
@@ -940,7 +965,7 @@ struct CollectiveMainloopFwdSm90 {
                 } else {
                     paged_kv_manager.load_page_table_TMA(n_block);
                 }
-                if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/); }
+                if constexpr (Transpose_V && !BypassPVEmuHardwareV) { load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/); }
                 load_K(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
                 if constexpr (!Transpose_V) {
                     if constexpr (IntraWGOverlap) {
@@ -951,13 +976,13 @@ struct CollectiveMainloopFwdSm90 {
                 }
             }
             n_block_prev = n_block;
-            if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write_v); }
+            if constexpr (Transpose_V && !BypassPVEmuHardwareV) { copy_Vt_to_V(smem_pipe_write_v); }
         }
         scheduler_prefetch();
         if constexpr (!Transpose_V && IntraWGOverlap) {
             if (should_load_KV) { load_V(n_block_prev, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
         }
-        if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write); }
+        if constexpr (Transpose_V && !BypassPVEmuHardwareV) { copy_Vt_to_V(smem_pipe_write); }
         ++smem_pipe_write;
         // At the end, all threads have the correct smem_pipe_write.
         ++work_idx;
@@ -979,8 +1004,8 @@ struct CollectiveMainloopFwdSm90 {
             *  then would just be acquired since the phase was still inverted from make_producer_start_state
             */
             pipeline_k.producer_tail(smem_pipe_write);
-            pipeline_v.producer_tail(smem_pipe_write);
-            if constexpr (Transpose_V) { pipeline_vt.producer_tail(smem_pipe_write); }
+            if constexpr (!BypassPVEmuHardwareV) { pipeline_v.producer_tail(smem_pipe_write); }
+            if constexpr (Transpose_V && !BypassPVEmuHardwareV) { pipeline_vt.producer_tail(smem_pipe_write); }
         }
     }
 
@@ -1057,7 +1082,13 @@ struct CollectiveMainloopFwdSm90 {
 
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
         Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});
-        Tensor sV = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVtMma{});
+        Tensor sV = [&] {
+            if constexpr (BypassPVEmuHardwareV) {
+                return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutVtMma{});
+            } else {
+                return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVtMma{});
+            }
+        }();
         Tensor sP = [&] {
             if constexpr (MmaPV_is_RS && !UsePVEmu) {
                 // placeholder: smem_q is unused as P storage on the pure-RS path
@@ -1068,7 +1099,11 @@ struct CollectiveMainloopFwdSm90 {
         }();
         Tensor sVl = [&] {
             if constexpr (UsePVEmu) {
-                return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v_emu.data()), SmemLayoutVl{});
+                if constexpr (BypassPVEmuHardwareV) {
+                    return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVl{});
+                } else {
+                    return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v_emu.data()), SmemLayoutVl{});
+                }
             } else {  // placeholder, never used
                 return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutVl{});
             }
@@ -1081,7 +1116,13 @@ struct CollectiveMainloopFwdSm90 {
             }
         }();
         Tensor sQv = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_qv.data()), SmemLayoutQv{});
-        Tensor sVMmaQV = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVMmaQV{});
+        Tensor sVMmaQV = [&] {
+            if constexpr (BypassPVEmuHardwareV) {
+                return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutVMmaQV{});
+            } else {
+                return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVMmaQV{});
+            }
+        }();
 
         if constexpr (!MmaQK_is_RS) {
             static_assert(stride<0>(typename TiledMmaQK::ALayout{}) == 0 and
@@ -1483,7 +1524,7 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
                 if constexpr (!Is_first_iter) { softmax.rescale_o(tOrO, scores_scale); }
                 if constexpr (!MmaPV_is_RS && !MmaPV_use_RS_WG1) { arrive_on_P_write_barrier(); }
-                if constexpr (!HasQv) { consumer_wait(pipeline_v, smem_pipe_read); }
+                if constexpr (!HasQv && !BypassPVEmuHardwareV) { consumer_wait(pipeline_v, smem_pipe_read); }
                 warp_scheduler_barrier_sync();
                 if constexpr (UsePVEmu) {
                     // Stage V[this KV block] from GLOBAL memory into the logical buffer sVl(k,n)
@@ -1586,7 +1627,7 @@ struct CollectiveMainloopFwdSm90 {
                     cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup,
                         static_cast<uint32_t>(FwdNamedBarriers::AppendKV) - 1 + flash::canonical_warp_group_idx_nosync());
                 }
-                pipeline_v.consumer_release(smem_pipe_read);  // release V
+                if constexpr (!BypassPVEmuHardwareV) { pipeline_v.consumer_release(smem_pipe_read); }  // release V
             };
 
             auto first_iter_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };

@@ -269,7 +269,30 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
         "hopper/instantiations/flash_fwd_hdim192_128_e4m3*_sm90.cu")
     list(APPEND FA3_FP8_GEN_SRCS ${FA3_FP8_GEN_SRCS_})
 
-    set(FA3_GEN_SRCS ${FA3_BF16_GEN_SRCS} ${FA3_FP16_GEN_SRCS} ${FA3_FP8_GEN_SRCS})
+    option(VLLM_FA3_HDIM256_E4M3_ONLY "Build only FA3 hdim256 FP8/e4m3 Hopper instantiations" OFF)
+    option(VLLM_FA3_HDIM128_E4M3_ONLY "Build only FA3 hdim128 FP8/e4m3 Hopper instantiations" OFF)
+    set(FA3_FOCUSED_DEFINES "")
+    if (VLLM_FA3_HDIM256_E4M3_ONLY OR VLLM_FA3_HDIM128_E4M3_ONLY)
+        set(FA3_GEN_SRCS)
+        list(APPEND FA3_FOCUSED_DEFINES VLLM_FA3_FOCUSED_E4M3_ONLY)
+        if (VLLM_FA3_HDIM256_E4M3_ONLY)
+            list(APPEND FA3_GEN_SRCS
+                "hopper/instantiations/flash_fwd_hdim256_e4m3_paged_softcap_sm90.cu"
+                "hopper/instantiations/flash_fwd_hdim256_e4m3_paged_split_softcap_sm90.cu")
+            list(APPEND FA3_FOCUSED_DEFINES VLLM_FA3_HDIM256_E4M3_ONLY)
+        endif()
+        if (VLLM_FA3_HDIM128_E4M3_ONLY)
+            list(APPEND FA3_GEN_SRCS
+                "hopper/instantiations/flash_fwd_hdim128_e4m3_paged_sm90.cu")
+            list(APPEND FA3_FOCUSED_DEFINES VLLM_FA3_HDIM128_E4M3_ONLY)
+        endif()
+    else()
+        set(FA3_GEN_SRCS ${FA3_BF16_GEN_SRCS} ${FA3_FP16_GEN_SRCS} ${FA3_FP8_GEN_SRCS})
+    endif()
+    if (FA3_FOCUSED_DEFINES)
+        set_source_files_properties(hopper/flash_api.cpp ${FA3_GEN_SRCS}
+            PROPERTIES COMPILE_DEFINITIONS "${FA3_FOCUSED_DEFINES}")
+    endif()
 
     # For CUDA we set the architectures on a per file basis
     # FaV3 is not yet supported in Blackwell

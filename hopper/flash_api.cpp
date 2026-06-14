@@ -265,6 +265,45 @@ void set_params_dgrad(Flash_bwd_params &params,
 }
 
 void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+#ifdef VLLM_FA3_FOCUSED_E4M3_ONLY
+    TORCH_CHECK(params.num_splits >= 1);
+    TORCH_CHECK(params.arch == 90,
+                "This focused FA3 build only supports SM90/Hopper, got arch=", params.arch);
+    TORCH_CHECK(params.is_e4m3,
+                "This focused FA3 build only supports FP8 e4m3 inputs.");
+    TORCH_CHECK(params.d == params.dv,
+                "This focused FA3 build only supports head_dim == head_dim_v, got d=",
+                params.d, ", dv=", params.dv);
+
+    bool const split = params.num_splits > 1;
+    bool const paged_kv_non_tma = params.page_table && !params.pagedkv_tma;
+    bool const has_softcap = params.softcap > 0.0;
+
+#ifdef VLLM_FA3_HDIM128_E4M3_ONLY
+    if (params.d == 128) {
+        TORCH_CHECK(!split,
+                    "This focused hdim128 FP8 build only supports non-split FA3 prefill.");
+        TORCH_CHECK(paged_kv_non_tma,
+                    "This focused hdim128 FP8 build only supports paged non-TMA KV.");
+        TORCH_CHECK(!has_softcap,
+                    "This focused hdim128 FP8 build only supports non-softcap attention.");
+        return run_mha_fwd_<90, cutlass::float_e4m3_t, 128, 128, false, true, false, true>(params, stream);
+    }
+#endif
+#ifdef VLLM_FA3_HDIM256_E4M3_ONLY
+    if (params.d == 256) {
+        TORCH_CHECK(paged_kv_non_tma,
+                    "This focused hdim256 FP8 build only supports paged non-TMA KV.");
+        TORCH_CHECK(has_softcap,
+                    "This focused hdim256 FP8 build only supports softcap attention.");
+        if (split) {
+            return run_mha_fwd_<90, cutlass::float_e4m3_t, 256, 256, true, true, true, true>(params, stream);
+        }
+        return run_mha_fwd_<90, cutlass::float_e4m3_t, 256, 256, false, true, true, true>(params, stream);
+    }
+#endif
+    TORCH_CHECK(false, "This focused FA3 build does not include head_dim=", params.d);
+#else
     // HEADDIM_SWITCH(params.d, [&] {
     //     run_mha_fwd_<cutlass::half_t, kHeadSize>(params, stream);
     // });
@@ -401,6 +440,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
             });
         });
     });
+#endif
 }
 
 void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool enable_pdl=false) {
@@ -1057,6 +1097,11 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         TORCH_CHECK(params.d == 128 || params.d == 256,
                     "qk_emu_enabled is only supported for head_dim == 128 or 256 "
                     "(d<=64 is non-deterministic), got d=", params.d);
+        if (params.d == 128 || params.d == 256) {
+            TORCH_CHECK(qk_emu_fbits == 13,
+                        "qk_emu_fbits must be 13 for head_dim == 128/256 in this focused build, got ",
+                        qk_emu_fbits);
+        }
     }
     params.pv_emu_enabled = pv_emu_enabled;
     params.pv_emu_fbits = static_cast<int>(pv_emu_fbits);
@@ -1070,25 +1115,18 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         TORCH_CHECK(params.d == 128 || params.d == 256,
                     "pv_emu_enabled is only supported for head_dim == 128 or 256 "
                     "(d<=64 is non-deterministic), got d=", params.d);
+        if (params.d == 128 || params.d == 256) {
+            TORCH_CHECK(pv_emu_fbits == 13,
+                        "pv_emu_fbits must be 13 for head_dim == 128/256 in this focused build, got ",
+                        pv_emu_fbits);
+        }
         // Paged KV is supported: the emu V-staging translates the logical seqlen position
         // to (page, page_offset) via the page table (mirrors PagedKVManager).
     }
-    // CoFDA emulation is exposed as BOTH-AXES ONLY at matching F-bits: QK and PV
-    // must be emulated together (mixing a hardware and an emulated gemm confounds
-    // the comparison). This guard enforces that at runtime.
-    //
-    // NOTE: the single-axis kernels are still INSTANTIATED (see
-    // flash_fwd_launch_template.h) even though this guard makes them unreachable.
-    // Removing them shrinks the build but exposes a build-sensitive codegen
-    // regression in the both-emu kernel: with only the both-emu instantiations in
-    // the TU, both-emu silently drifts ~0.2% on the real model (WikiText-2 limit 1:
-    // 6.3369 -> 6.3238) while staying synthetically bit-exact. Not a race
-    // (compute-sanitizer racecheck clean) and not ccache. Keep single-axis
-    // instantiated until that codegen sensitivity is root-caused/fixed.
-    if (qk_emu_enabled || pv_emu_enabled) {
-        TORCH_CHECK(qk_emu_enabled && pv_emu_enabled,
-                    "CoFDA emulation requires BOTH qk_emu_enabled and pv_emu_enabled "
-                    "(single-axis ref+emu is disabled); enable both together");
+    // CoFDA emulation can be enabled for QK only, PV only, or both axes.
+    // When both axes are emulated, keep f-bits matched so a run represents
+    // one precision point instead of mixing two emulation precisions.
+    if (qk_emu_enabled && pv_emu_enabled) {
         TORCH_CHECK(qk_emu_fbits == pv_emu_fbits,
                     "both-emu requires matching qk_emu_fbits == pv_emu_fbits, got qk=",
                     qk_emu_fbits, ", pv=", pv_emu_fbits);
